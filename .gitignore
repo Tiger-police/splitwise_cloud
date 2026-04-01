@@ -1,0 +1,33 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境 (绝对不能传到 Git！)
+venv/
+.venv/
+
+# 机密配置文件
+backend/.env
+monitor/.env
+
+# 数据库文件 (保护用户数据)
+data/*.db
+data/*.sqlite3
+
+# IDE 配置
+.idea/
+.vscode/
+
+# ========================
+# 编辑器与系统临时文件
+# ========================
+*.save
+*.swp
+*~
+.DS_Store
+
+# ========================
+# 监控系统数据卷挂载目录 (预防未来产生本地数据)
+# ========================
+monitor/prometheus_data/
+monitor/grafana_data/

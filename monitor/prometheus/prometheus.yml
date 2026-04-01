@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-metrics'
+    # 动态向你的 FastAPI 后端请求 node_exporter (9100) 的列表
+    http_sd_configs:
+      - url: 'http://10.144.144.2:8010/api/v1/system/devices/prometheus/targets/node'
+        refresh_interval: 15s # 每 15 秒同步一次最新设备列表
+
+  - job_name: 'gpu-metrics'
+    # 动态向你的 FastAPI 后端请求 dcgm_exporter (9400) 的列表
+    http_sd_configs:
+      - url: 'http://10.144.144.2:8010/api/v1/system/devices/prometheus/targets/gpu'
+        refresh_interval: 15s
