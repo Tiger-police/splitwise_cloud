@@ -6,6 +6,7 @@ from app.models.models import User, Device  # 新增数据库模型
 from app.schemas.schemas import EdgeTriggerRequest
 from app.services.scheduler import encode_state, request_strategy_model_mock
 import json
+import shutil
 import asyncio
 import httpx
 
@@ -83,21 +84,82 @@ async def fetch_metrics_from_prometheus(ip: str) -> dict:
     }
 
 
+async def ping_host(host: str, count: int = 4, timeout: float = 1.0) -> tuple[float, float]:
+    """使用 ping3 测量主机 RTT 和丢包率。"""
+    try:
+        from ping3 import ping
+    except ImportError:
+        return 0.0, 0.0
+
+    rtts: list[float] = []
+    lost = 0
+    for _ in range(count):
+        try:
+            result = await asyncio.to_thread(ping, host, timeout=timeout, unit="ms")
+            if result is None:
+                lost += 1
+            else:
+                rtts.append(float(result))
+        except Exception:
+            lost += 1
+
+    avg_rtt = round(sum(rtts) / len(rtts), 2) if rtts else 0.0
+    packet_loss = round((lost / count) * 100.0, 2)
+    return avg_rtt, packet_loss
+
+
+async def measure_bandwidth(edge_ip: str) -> float:
+    """若本机上安装了 iperf3，并且 edge 端有 iperf3 server，可测量带宽。"""
+    if not shutil.which("iperf3"):
+        return 0.0
+
+    cmd = ["iperf3", "-c", edge_ip, "-f", "m", "-t", "3", "--json"]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            return 0.0
+
+        payload = json.loads(stdout.decode("utf-8"))
+        bits_per_second = payload.get("end", {}).get("sum_received", {}).get("bits_per_second")
+        if bits_per_second is None:
+            bits_per_second = payload.get("end", {}).get("sum_sent", {}).get("bits_per_second")
+        if bits_per_second is None:
+            return 0.0
+
+        return round(float(bits_per_second) / 1_000_000.0, 2)
+    except Exception:
+        return 0.0
+
+
 async def get_network_metrics(edge_ip: str, cloud_ip: str) -> dict:
     """
     云端主动收集端到端的网络状态指标。
-    （注：目前返回的是模拟/默认数据。在真实的工业级部署中，你可以通过 Python 的
-    ping3 库、iperf3 测试，或者从 Prometheus 的 node_network 指标中动态拉取）
+
+    真实采集方案建议：
+    1. RTT 与丢包：通过 ping 或 ICMP 测试获取 edge -> cloud 和 cloud -> edge 的延迟与丢包。
+    2. 带宽：如果 edge 端能运行 iperf3 server，可由 cloud 端发起 iperf3 测试；
+       否则可从 Prometheus 的网卡流量速率指标估算。
+    3. 如果只有单向可测量，则将 edge_to_cloud_rtt_ms 设为可测 RTT 的近似值，
+       并在后续设计中补充 edge 端主动上报。
     """
-    # 模拟网络延迟获取过程
-    await asyncio.sleep(0.1)
+    edge_rtt, edge_loss = await ping_host(edge_ip)
+    cloud_rtt, cloud_loss = await ping_host(cloud_ip)
+    bandwidth = await measure_bandwidth(edge_ip)
+
+    estimated_bandwidth_mbps = bandwidth if bandwidth > 0 else 1000.0
+    packet_loss = round(max(edge_loss, cloud_loss), 2)
 
     return {
-        "edge_rtt_ms": 4.84,
-        "cloud_rtt_ms": 2.72,
-        "edge_to_cloud_rtt_ms": 4.84,
-        "estimated_bandwidth_mbps": 1000.0,
-        "packet_loss": 0.0
+        "edge_rtt_ms": edge_rtt,
+        "cloud_rtt_ms": cloud_rtt,
+        "edge_to_cloud_rtt_ms": edge_rtt,
+        "estimated_bandwidth_mbps": estimated_bandwidth_mbps,
+        "packet_loss": packet_loss
     }
 
 @router.post("/trigger", summary="接收边端触发，获取调度策略")
