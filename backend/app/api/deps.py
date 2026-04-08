@@ -1,13 +1,23 @@
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt
 from jwt import PyJWTError
 
-from app.core.config import settings
+from app.core.security import decode_internal_access_token
 from app.db.database import SessionLocal
 from app.models.models import User
 
 security = HTTPBearer()
+
+
+def decode_token_to_username(token: str) -> str:
+    try:
+        payload = decode_internal_access_token(token)
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Token 数据异常")
+        return username
+    except PyJWTError:
+        raise HTTPException(status_code=401, detail="Token 已过期或被篡改，请重新登录")
 
 def get_db():
     db = SessionLocal()
@@ -19,14 +29,7 @@ def get_db():
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """基础门禁：校验 Token"""
     token = credentials.credentials
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Token 数据异常")
-        return username
-    except PyJWTError:
-        raise HTTPException(status_code=401, detail="Token 已过期或被篡改，请重新登录")
+    return decode_token_to_username(token)
 
 async def get_current_admin(
     username: str = Depends(get_current_user),
