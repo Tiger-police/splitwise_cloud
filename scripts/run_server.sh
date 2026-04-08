@@ -24,4 +24,17 @@ fi
 # 3. 切换到后端目录并启动服务 (读取后端的 .env)
 echo "🌐 正在拉起 FastAPI 服务与监控大屏..."
 cd "$BACKEND_DIR"
+
+if [ -f "$BACKEND_DIR/.env" ]; then
+    set -a
+    source "$BACKEND_DIR/.env"
+    set +a
+fi
+
+if [ "${OPENWEBUI_SKIP_SIGNATURE_VERIFY:-false}" = "true" ]; then
+    echo "🧪 当前处于 OpenWebUI 跳过验签模式，适用于开发联调。"
+elif [ -z "${OPENWEBUI_JWT_SECRET:-}" ]; then
+    echo "⚠️ 未检测到 OPENWEBUI_JWT_SECRET，OpenWebUI token exchange 接口将返回配置未完成提示。"
+fi
+
 python -m app.main
