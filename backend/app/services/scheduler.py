@@ -5,7 +5,7 @@ from typing import List, Dict
 logger = logging.getLogger("SchedulerService")
 
 
-def encode_state(model_type: str, env: dict, prompt_len: int) -> List[float]:
+def encode_state(model_type: str, env: dict, max_context_length: int) -> List[float]:
     """
     将环境状态编码为 26 维特征向量，严格遵循 API 文档第 4 节的归一化要求
     """
@@ -16,7 +16,7 @@ def encode_state(model_type: str, env: dict, prompt_len: int) -> List[float]:
     network = env.get("network", {})
     mt_lower = model_type.lower()
 
-    state[0] = prompt_len / 256.0
+    state[0] = max_context_length / 256.0
 
     if mt_lower == "gpt2":
         state[1] = 1.0
@@ -86,10 +86,10 @@ async def request_strategy_model_mock(state_vector: List[float], model_type: str
     for i in range(num_layers):
         if i < num_layers // 2:
             layer_partitions.append(
-                {"layer_id": i, "head_assignments": [0] * 12, "ffn_assignment": 0, "edge_heads": 12, "cloud_heads": 0})
+                {"layer_id": i, "head_assignments": [0] * 12, "ffn_assignment": 0})
         else:
             layer_partitions.append(
-                {"layer_id": i, "head_assignments": [1] * 12, "ffn_assignment": 1, "edge_heads": 0, "cloud_heads": 12})
+                {"layer_id": i, "head_assignments": [1] * 12, "ffn_assignment": 1})
 
     print("✅ 成功接收到策略模型的细粒度切分方案！")
     print("🚀 " * 20 + "\n")

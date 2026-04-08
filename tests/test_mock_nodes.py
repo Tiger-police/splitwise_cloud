@@ -4,11 +4,11 @@ import asyncio
 API_BASE = "http://127.0.0.1:8010/api/v1"
 
 nodes_to_simulate = [
-    {"role": "☁️ 云端解码", "ip": "10.144.144.2", "port": 8022, "model": "meta-llama/Llama-3.2-3B-Instruct"},
-    {"role": "☁️ 云端解码", "ip": "10.144.144.2", "port": 8023, "model": "Qwen/Qwen2.5-7B-Instruct"},
-    {"role": "📱 边缘预填充", "ip": "10.144.144.3", "port": 8021, "model": "meta-llama/Llama-3.2-3B-Instruct"},
-    {"role": "📱 边缘预填充", "ip": "10.144.144.3", "port": 8024, "model": "microsoft/Phi-3-mini-4k-instruct"},
-    {"role": "📱 边缘预填充", "ip": "10.144.144.4", "port": 8021, "model": "Qwen/Qwen2.5-7B-Instruct"}
+    {"role": "☁️ 云端解码", "ip": "10.144.144.2", "port": 8022, "model_key": "llama-3.2-3b"},
+    {"role": "☁️ 云端解码", "ip": "10.144.144.2", "port": 8023, "model_key": "qwen2.5-7b"},
+    {"role": "📱 边缘预填充", "ip": "10.144.144.3", "port": 8021, "model_key": "llama-3.2-3b"},
+    {"role": "📱 边缘预填充", "ip": "10.144.144.3", "port": 8024, "model_key": "phi-3-mini"},
+    {"role": "📱 边缘预填充", "ip": "10.144.144.4", "port": 8021, "model_key": "qwen2.5-7b"}
 ]
 
 
@@ -16,11 +16,11 @@ async def register_node(client, node):
     """向云端发送注册/心跳包"""
     try:
         await client.post(f"{API_BASE}/models/register", json={
-            "model_name": node["model"],
+            "model_key": node["model_key"],
             "ip_address": node["ip"],
             "port": node["port"]
         })
-        print(f"✅ [{node['role']}] 心跳 -> {node['ip']}:{node['port']} ({node['model']})")
+        print(f"✅ [{node['role']}] 心跳 -> {node['ip']}:{node['port']} ({node['model_key']})")
     except Exception as e:
         print(f"❌ [{node['role']}] 连接失败: {e}")
 

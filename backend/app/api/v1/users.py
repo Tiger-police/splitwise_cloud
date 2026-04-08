@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
-from app.db.database import SessionLocal
 from app.models.models import User, Device
-from app.schemas.schemas import UserCreate
+from app.schemas.schemas import UserCreate, UserOpenWebUIBindingUpdate
 from app.api.deps import get_current_user, get_current_admin, get_db
 from app.core.security import get_password_hash
 
@@ -15,18 +14,39 @@ async def get_my_devices(current_username: str = Depends(get_current_user), db =
 
     allowed_keys = user.allowed_devices.split(",")
     devices = db.query(Device).filter(Device.id.in_(allowed_keys)).all()
-    return {"user": current_username, "devices": [{"name": d.name, "value": d.value} for d in devices]}
+    return {
+        "user": current_username,
+        "devices": [
+            {
+                "id": d.id,
+                "name": d.name,
+                "value": d.value,
+                "type": d.device_type,
+            }
+            for d in devices
+        ],
+    }
 
 @router.get("", summary="【Admin】获取所有账号列表")
 async def list_users(admin_user: User = Depends(get_current_admin), db = Depends(get_db)):
     users = db.query(User).all()
-    return [{"username": u.username, "role": u.role, "devices": u.allowed_devices} for u in users]
+    return [
+        {
+            "username": u.username,
+            "role": u.role,
+            "devices": u.allowed_devices,
+            "openwebui_user_id": u.openwebui_user_id,
+        }
+        for u in users
+    ]
 
 
 @router.post("", summary="【Admin】创建新账号")
 async def create_user(user_in: UserCreate, admin_user: User = Depends(get_current_admin), db=Depends(get_db)):
     if db.query(User).filter(User.username == user_in.username).first():
         raise HTTPException(status_code=400, detail="账号名已存在")
+    if user_in.openwebui_user_id and db.query(User).filter(User.openwebui_user_id == user_in.openwebui_user_id).first():
+        raise HTTPException(status_code=400, detail="OpenWebUI 用户 ID 已绑定到其他账号")
 
     if user_in.role == "user":
         device_ids = [d_id for d_id in user_in.allowed_devices.split(",") if d_id]
@@ -45,6 +65,7 @@ async def create_user(user_in: UserCreate, admin_user: User = Depends(get_curren
 
     new_user = User(
         username=user_in.username,
+        openwebui_user_id=user_in.openwebui_user_id,
         hashed_password=get_password_hash(user_in.password),
         role=user_in.role,
         allowed_devices=final_devices
@@ -52,6 +73,29 @@ async def create_user(user_in: UserCreate, admin_user: User = Depends(get_curren
     db.add(new_user)
     db.commit()
     return {"status": "success", "message": "创建成功"}
+
+
+@router.patch("/{username}/openwebui-binding", summary="【Admin】更新账号的 OpenWebUI 用户 ID 绑定")
+async def update_openwebui_binding(
+    username: str,
+    binding: UserOpenWebUIBindingUpdate,
+    admin_user: User = Depends(get_current_admin),
+    db = Depends(get_db),
+):
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="未找到该账号")
+
+    duplicate = db.query(User).filter(
+        User.openwebui_user_id == binding.openwebui_user_id,
+        User.username != username,
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=400, detail="OpenWebUI 用户 ID 已绑定到其他账号")
+
+    user.openwebui_user_id = binding.openwebui_user_id
+    db.commit()
+    return {"status": "success", "message": "OpenWebUI 绑定已更新"}
 
 @router.delete("/{username}", summary="【Admin】删除账号")
 async def delete_user(username: str, admin_user: User = Depends(get_current_admin), db = Depends(get_db)):
