@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import decode_token_to_username, get_current_user, get_db
 from app.core.config import settings
-from app.db.database import SessionLocal
+from app.db.database import SessionLocal, session_scope
 from app.models.models import Device, ModelNode, ScheduleTask, User
 from app.schemas.schemas import (
     EdgeTriggerRequest,
@@ -23,10 +23,12 @@ from app.schemas.schemas import (
     StrategyCallbackRequest,
 )
 from app.services.scheduler import encode_state
+from app.services.network_probe import get_network_metrics
+from app.services.prometheus_metrics import get_prometheus_metrics
+from app.services.task_queue import task_queue, TaskState
 
 PROMETHEUS_URL = settings.PROMETHEUS_URL
 TASK_TERMINAL_STATUSES = {"completed", "failed"}
-PENDING_STRATEGY_TASKS = {}
 
 router = APIRouter()
 logger = logging.getLogger("ScheduleRouter")
@@ -191,47 +193,6 @@ def find_runtime_node(db: Session, device_id: str, model_key: str, node_role: st
     return candidates[0] if len(candidates) == 1 else None
 
 
-async def query_prom(client: httpx.AsyncClient, query: str) -> float:
-    try:
-        resp = await client.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=3.0)
-        data = resp.json()
-        result = data.get("data", {}).get("result", [])
-        if result:
-            return float(result[0].get("value", [0, "0"])[1])
-        logger.warning("Prometheus 查询结果为空，已回退为 0.0: %s", query)
-    except Exception as exc:
-        logger.warning("Prometheus 查询失败，已回退为 0.0: %s, error=%s", query, exc)
-    return 0.0
-
-
-async def fetch_metrics_from_prometheus(ip: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        ip_regex = f"^{ip}:.*"
-
-        q_cpu = f'100 - (avg(rate(node_cpu_seconds_total{{instance=~"{ip_regex}",mode="idle"}}[1m])) * 100)'
-        q_mem = f'100 * (1 - node_memory_MemAvailable_bytes{{instance=~"{ip_regex}"}} / node_memory_MemTotal_bytes{{instance=~"{ip_regex}"}})'
-        q_gpu_util = f'avg(max_over_time(DCGM_FI_DEV_GPU_UTIL{{instance=~"{ip_regex}"}}[2m]))'
-        q_gpu_used = f'sum(DCGM_FI_DEV_FB_USED{{instance=~"{ip_regex}"}})'
-        q_gpu_free = f'sum(DCGM_FI_DEV_FB_FREE{{instance=~"{ip_regex}"}})'
-
-        cpu, mem, g_util, g_used, g_free = await asyncio.gather(
-            query_prom(client, q_cpu),
-            query_prom(client, q_mem),
-            query_prom(client, q_gpu_util),
-            query_prom(client, q_gpu_used),
-            query_prom(client, q_gpu_free),
-        )
-
-    return {
-        "cpu_percent": round(cpu, 2),
-        "memory_percent": round(mem, 2),
-        "gpu_util_percent": round(g_util, 2),
-        "gpu_mem_used_mb": round(g_used, 2),
-        "gpu_mem_total_mb": round(g_used + g_free, 2) if (g_used + g_free) > 0 else 1.0,
-        "queue_len": 0.0,
-    }
-
-
 def derive_edge_storage_limit_gb_from_metrics(edge_metrics: dict) -> float:
     """
     当前将 storage_limit_gb 解释为“边端可用显存预算(GB)”。
@@ -250,183 +211,6 @@ def derive_edge_storage_limit_gb_from_metrics(edge_metrics: dict) -> float:
     return round(gpu_available_mb / 1024.0, 2)
 
 
-async def get_network_metrics(edge_ip: str, cloud_ip: str) -> dict:
-    """
-    低风险网络探测版本：
-    1. 优先尝试通过 ping3 探测 RTT 与丢包。
-    2. iperf3 带宽测试默认关闭，仅在显式开启并且本机安装了 iperf3 时执行。
-    3. 任一探测不可用时，自动回退到配置里的默认值，不影响调度主流程。
-
-    当前 edge_to_cloud_rtt_ms 仍是近似值，优先使用云端到边端的 RTT 作为估计。
-    """
-
-    async def ping_host_with_system_ping(host: str, count: int, timeout: float) -> tuple[float | None, float | None]:
-        if not shutil.which("ping"):
-            logger.info("未检测到系统 ping 命令，网络 RTT 探测将回退到默认值")
-            return None, None
-
-        cmd = [
-            "ping",
-            "-c",
-            str(count),
-            "-W",
-            str(max(1, int(timeout))),
-            host,
-        ]
-        process = None
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=(count * timeout) + 2)
-            output = (stdout or b"").decode("utf-8", errors="ignore")
-            if process.returncode not in {0, 1}:
-                logger.warning(
-                    "系统 ping 执行失败，已回退到默认值: host=%s, returncode=%s, stderr=%s",
-                    host,
-                    process.returncode,
-                    (stderr or b"").decode("utf-8", errors="ignore").strip(),
-                )
-                return None, None
-
-            packet_loss_match = re.search(r"(\d+(?:\.\d+)?)%\s+packet loss", output)
-            rtt_match = re.search(
-                r"rtt min/avg/max(?:/mdev)? = \d+(?:\.\d+)?/(\d+(?:\.\d+)?)/",
-                output,
-            )
-            if not packet_loss_match or not rtt_match:
-                logger.warning("系统 ping 输出无法解析，已回退到默认值: host=%s, output=%s", host, output.strip())
-                return None, None
-
-            avg_rtt = round(float(rtt_match.group(1)), 2)
-            packet_loss = round(float(packet_loss_match.group(1)), 2)
-            return avg_rtt, packet_loss
-        except asyncio.TimeoutError:
-            logger.warning("系统 ping 超时，已回退到默认值: host=%s", host)
-            if process and process.returncode is None:
-                process.kill()
-                await process.communicate()
-            return None, None
-        except Exception as exc:
-            logger.warning("系统 ping 探测失败，已回退到默认值: host=%s, error=%s", host, exc)
-            return None, None
-
-    async def ping_host(host: str, count: int, timeout: float) -> tuple[float | None, float | None]:
-        try:
-            from ping3 import ping
-        except ImportError:
-            logger.info("未安装 ping3，将尝试使用系统 ping 命令探测 RTT")
-            return await ping_host_with_system_ping(host, count, timeout)
-
-        rtts: list[float] = []
-        lost = 0
-        hard_failure = False
-        for _ in range(count):
-            try:
-                result = await asyncio.to_thread(ping, host, timeout=timeout, unit="ms")
-                if result is None:
-                    lost += 1
-                else:
-                    rtts.append(float(result))
-            except PermissionError as exc:
-                logger.warning("ping3 探测缺少权限，将尝试使用系统 ping: host=%s, error=%s", host, exc)
-                hard_failure = True
-                break
-            except Exception as exc:
-                logger.warning("ping 探测失败: host=%s, error=%s", host, exc)
-                lost += 1
-
-        if hard_failure:
-            return await ping_host_with_system_ping(host, count, timeout)
-
-        avg_rtt = round(sum(rtts) / len(rtts), 2) if rtts else 0.0
-        packet_loss = round((lost / count) * 100.0, 2)
-        return avg_rtt, packet_loss
-
-    async def measure_bandwidth(target_ip: str) -> float:
-        if not settings.NETWORK_ENABLE_IPERF3:
-            return 0.0
-        if not shutil.which("iperf3"):
-            logger.info("未检测到 iperf3，可用带宽将回退到默认值")
-            return 0.0
-
-        cmd = [
-            "iperf3",
-            "-c",
-            target_ip,
-            "-f",
-            "m",
-            "-t",
-            str(settings.NETWORK_IPERF3_DURATION_SECONDS),
-            "--json",
-        ]
-        process = None
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=settings.NETWORK_IPERF3_DURATION_SECONDS + 2,
-            )
-            if process.returncode != 0:
-                return 0.0
-
-            payload = json.loads(stdout.decode("utf-8"))
-            bits_per_second = payload.get("end", {}).get("sum_received", {}).get("bits_per_second")
-            if bits_per_second is None:
-                bits_per_second = payload.get("end", {}).get("sum_sent", {}).get("bits_per_second")
-            if bits_per_second is None:
-                return 0.0
-
-            return round(float(bits_per_second) / 1_000_000.0, 2)
-        except asyncio.TimeoutError:
-            logger.warning("iperf3 带宽探测超时，已回退到默认值: target_ip=%s", target_ip)
-            if process and process.returncode is None:
-                process.kill()
-                await process.communicate()
-            return 0.0
-        except Exception as exc:
-            logger.warning("iperf3 带宽探测失败，已回退到默认值: target_ip=%s, error=%s", target_ip, exc)
-            return 0.0
-
-    default_metrics = {
-        "edge_rtt_ms": settings.NETWORK_DEFAULT_EDGE_RTT_MS,
-        "cloud_rtt_ms": settings.NETWORK_DEFAULT_CLOUD_RTT_MS,
-        "edge_to_cloud_rtt_ms": settings.NETWORK_DEFAULT_EDGE_RTT_MS,
-        "estimated_bandwidth_mbps": settings.NETWORK_DEFAULT_BANDWIDTH_MBPS,
-        "packet_loss": settings.NETWORK_DEFAULT_PACKET_LOSS,
-    }
-
-    edge_ping, cloud_ping, bandwidth = await asyncio.gather(
-        ping_host(edge_ip, settings.NETWORK_PING_COUNT, settings.NETWORK_PING_TIMEOUT_SECONDS),
-        ping_host(cloud_ip, settings.NETWORK_PING_COUNT, settings.NETWORK_PING_TIMEOUT_SECONDS),
-        measure_bandwidth(edge_ip),
-    )
-
-    edge_rtt, edge_loss = edge_ping
-    cloud_rtt, cloud_loss = cloud_ping
-
-    resolved_edge_rtt = default_metrics["edge_rtt_ms"] if edge_rtt is None else edge_rtt
-    resolved_cloud_rtt = default_metrics["cloud_rtt_ms"] if cloud_rtt is None else cloud_rtt
-    resolved_bandwidth = bandwidth if bandwidth > 0 else default_metrics["estimated_bandwidth_mbps"]
-
-    loss_candidates = [loss for loss in (edge_loss, cloud_loss) if loss is not None]
-    resolved_packet_loss = round(max(loss_candidates), 2) if loss_candidates else default_metrics["packet_loss"]
-
-    metrics = {
-        "edge_rtt_ms": round(resolved_edge_rtt, 2),
-        "cloud_rtt_ms": round(resolved_cloud_rtt, 2),
-        "edge_to_cloud_rtt_ms": round(resolved_edge_rtt, 2),
-        "estimated_bandwidth_mbps": round(resolved_bandwidth, 2),
-        "packet_loss": resolved_packet_loss,
-    }
-    logger.info("网络状态采集完成: edge_ip=%s, cloud_ip=%s, metrics=%s", edge_ip, cloud_ip, metrics)
-    return metrics
 
 
 async def dispatch_strategy_to_runtime(node: ModelNode, payload: dict) -> None:
@@ -499,8 +283,8 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             return
 
         edge_metrics, cloud_metrics, network_metrics = await asyncio.gather(
-            fetch_metrics_from_prometheus(edge_ip),
-            fetch_metrics_from_prometheus(cloud_ip),
+            get_prometheus_metrics(edge_ip),
+            get_prometheus_metrics(cloud_ip),
             get_network_metrics(edge_ip, cloud_ip),
         )
         edge_storage_limit_gb = derive_edge_storage_limit_gb_from_metrics(edge_metrics)
@@ -567,9 +351,8 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             message="状态向量已生成，正在请求切分策略模型",
         )
 
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        PENDING_STRATEGY_TASKS[task_id] = future
+        # 标记任务为等待回调状态（替代 asyncio.Future）
+        task_queue.mark_task_waiting_callback(task_id, "strategy")
 
         payload_to_algorithm = {
             "task_id": task_id,
@@ -594,7 +377,18 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             message="切分策略模型已受理请求，等待算法回调",
         )
 
-        decision_result = await asyncio.wait_for(future, timeout=30.0)
+        # 使用 task_queue 等待回调（替代 asyncio.wait_for(future)）
+        callback_received = await task_queue.wait_for_callback(task_id, timeout_seconds=30.0)
+        if not callback_received:
+            # 超时处理已在 task_queue 中完成
+            return
+
+        # 获取回调数据
+        decision_result = task_queue.get_callback_data(task_id)
+        if not decision_result:
+            fail_task(db, task, "策略回调数据解析失败", "无法从任务队列获取回调数据")
+            return
+
         logger.info(
             "策略回调完成: task_id=%s, decision=%s",
             task_id,
@@ -682,19 +476,16 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             cloud_status="loading",
         )
 
-    except asyncio.TimeoutError:
-        if task_id in PENDING_STRATEGY_TASKS:
-            PENDING_STRATEGY_TASKS.pop(task_id, None)
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        if task:
-            fail_task(db, task, "等待算法组计算切分策略超时", "等待算法组计算切分策略超时 (30s)")
     except Exception as exc:
         logger.exception("调度任务执行异常: task_id=%s", task_id)
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        if task:
-            fail_task(db, task, "调度任务执行失败", str(exc))
-    finally:
-        PENDING_STRATEGY_TASKS.pop(task_id, None)
+        try:
+            task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
+            if task:
+                fail_task(db, task, "调度任务执行失败", str(exc))
+        except Exception:
+            logger.exception("调度任务异常处理失败: task_id=%s", task_id)
+        if db.in_transaction():
+            db.rollback()
         db.close()
 
 
@@ -756,8 +547,7 @@ async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
 
     async def event_generator():
         while True:
-            db = SessionLocal()
-            try:
+            with session_scope() as db:
                 task = (
                     db.query(ScheduleTask)
                     .filter(ScheduleTask.task_id == task_id, ScheduleTask.username == current_username)
@@ -773,8 +563,6 @@ async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
 
                 if task.status in TASK_TERMINAL_STATUSES:
                     break
-            finally:
-                db.close()
 
             await asyncio.sleep(1)
 
@@ -784,19 +572,25 @@ async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
 @router.post("/strategy_callback", summary="【算法组专用】接收切分策略回调")
 async def receive_strategy_decision(payload: StrategyCallbackRequest):
     task_id = payload.task_id
-    if task_id not in PENDING_STRATEGY_TASKS:
-        raise HTTPException(status_code=404, detail="未找到对应的任务ID，或任务已超时废弃")
+    
+    # 检查任务是否存在
+    with session_scope() as db:
+        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="未找到对应的任务ID，或任务已超时废弃")
 
-    future = PENDING_STRATEGY_TASKS[task_id]
-    if not future.done():
-        future.set_result(payload.model_dump())
+    # 通知任务队列回调已到达
+    callback_data = payload.model_dump()
+    success = task_queue.notify_task_callback(task_id, callback_data=callback_data)
+    
+    if not success:
+        logger.warning("⚠️ 无法通知任务回调: task_id=%s", task_id)
 
     return {"status": "success", "message": f"任务 {task_id} 切分策略已成功接收并交付"}
 
 
 async def handle_runtime_progress(payload: RuntimeProgressCallbackRequest, callback_role: str | None = None):
-    db = SessionLocal()
-    try:
+    with session_scope() as db:
         task = db.query(ScheduleTask).filter(ScheduleTask.task_id == payload.task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="未找到对应的调度任务")
@@ -848,8 +642,6 @@ async def handle_runtime_progress(payload: RuntimeProgressCallbackRequest, callb
             )
 
         return {"status": "success", "message": "加载进度已记录"}
-    finally:
-        db.close()
 
 
 @router.post("/runtime_callback", summary="【推理节点专用】接收边云模型加载进度回调（兼容旧版）")
