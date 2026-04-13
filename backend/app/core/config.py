@@ -40,6 +40,8 @@ class Settings:
     # 服务器配置
     HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
     PORT: int = int(os.getenv("SERVER_PORT", 8010))
+    ADMIN_USERNAME: str = os.getenv("ADMIN_USERNAME", "")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")#允许后端从环境变量读用户名和密码
     PUBLIC_BASE_URL: str = os.getenv("SERVER_PUBLIC_BASE_URL", f"http://127.0.0.1:{PORT}")
 
     # 外部服务配置
