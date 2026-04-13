@@ -11,7 +11,7 @@ from datetime import datetime
 from app.api.deps import get_db
 from app.models.models import Device, ModelNode
 from app.schemas.schemas import ModelRegisterRequest, ModelUnregisterRequest
-from app.db.database import SessionLocal
+from app.db.database import SessionLocal, session_scope
 
 logger = logging.getLogger("MonitorRouter")
 router = APIRouter()
@@ -163,20 +163,15 @@ async def stream_models_status():
 
     async def event_generator():
         while True:
-            db = SessionLocal()
-            try:
-                nodes = db.query(ModelNode).all()
-                result = []
-                for n in nodes:
-                    result.append(serialize_model_node(cast(Any, n)))
+            with session_scope() as db:
+                try:
+                    nodes = db.query(ModelNode).all()
+                    result = [serialize_model_node(cast(Any, n)) for n in nodes]
 
-                payload = json.dumps({"status": "success", "nodes": result})
-                yield f"data: {payload}\n\n"
-
-            except Exception as e:
-                logging.error(f"SSE 推送异常: {e}")
-            finally:
-                db.close()
+                    payload = json.dumps({"status": "success", "nodes": result})
+                    yield f"data: {payload}\n\n"
+                except Exception as e:
+                    logging.error(f"SSE 推送异常: {e}")
 
             await asyncio.sleep(2)
 
