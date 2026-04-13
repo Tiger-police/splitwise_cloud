@@ -3,6 +3,7 @@ from sqlalchemy import Column, Integer, String, DateTime, Text, inspect, text
 from datetime import datetime
 from app.db.database import Base, SessionLocal, engine
 from app.core.security import get_password_hash
+from app.core.config import settings
 
 logger = logging.getLogger("InitDB")
 
@@ -114,6 +115,8 @@ def init_db_data():
     系统首次启动时，检查并注入默认的物理设备和管理员账号
     """
     db = SessionLocal()
+    admin_username = settings.ADMIN_USERNAME or "admin"
+    admin_password = settings.ADMIN_PASSWORD or "admin123"
 
     if not db.query(Device).first():
         logger.info("🛠️ 首次启动：正在向数据库注入默认物理设备资产...")
@@ -127,12 +130,12 @@ def init_db_data():
         ])
         db.commit()
 
-    if not db.query(User).filter(User.username == "admin").first():
+    if not db.query(User).filter(User.username == admin_username).first():
         logger.info("🛠️ 首次启动：正在向数据库注入初始管理员和普通用户账号...")
         admin = User(
-            username="admin",
+            username=admin_username,
             openwebui_user_id="ow-admin",
-            hashed_password=get_password_hash("admin123"),
+            hashed_password=get_password_hash(admin_password),
             role="admin",
             allowed_devices="cloud,edge_A,edge_B"
         )
