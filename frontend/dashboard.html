@@ -56,7 +56,7 @@
             <div style="text-align: center; font-size: 1.5rem; font-weight: bold; margin-bottom: 10px;">云边协同调度枢纽</div>
             <div class="input-group">
                 <label>身份凭证 (Username)</label>
-                <input type="text" id="login-user" placeholder="输入 admin 或 userA" autocomplete="off">
+                <input type="text" id="login-user" placeholder="仅支持管理员账号，如 admin" autocomplete="off">
             </div>
             <div class="input-group">
                 <label>访问密钥 (Password)</label>
@@ -77,32 +77,18 @@
                 <div class="admin-section">
                     <div class="user-table-container">
                         <table>
-                            <thead><tr><th>账号名</th><th>角色</th><th>OpenWebUI 用户 ID</th><th>拥有权限设备</th><th>操作</th></tr></thead>
+                            <thead><tr><th>账号名</th><th>角色</th><th>拥有监控设备</th><th>操作</th></tr></thead>
                             <tbody id="user-table-body"></tbody>
                         </table>
                     </div>
                     <div class="add-user-form">
-                        <h3 class="section-title">新增账号</h3>
+                        <h3 class="section-title">新增管理员账号</h3>
                         <div class="input-group" style="margin-bottom: 10px;"><label>账号名</label><input type="text" id="new-username" placeholder="如 userB"></div>
                         <div class="input-group" style="margin-bottom: 10px;"><label>密码</label><input type="password" id="new-password"></div>
-                        <div class="input-group" style="margin-bottom: 10px;">
-                            <label>OpenWebUI 用户 ID</label>
-                            <input type="text" id="new-openwebui-user-id" placeholder="如 ow-userB">
-                        </div>
-                        <div class="input-group" style="margin-bottom: 10px;">
-                            <label>角色</label>
-                            <select id="new-role" onchange="toggleDeviceSelection()">
-                                <option value="user">普通用户</option>
-                                <option value="admin">管理员</option>
-                            </select>
-                        </div>
                         <div class="input-group" style="margin-bottom: 15px;">
-                            <label>分配监控权限</label>
-                            <div id="device-selection-area">
-                                <div class="checkbox-group" id="dynamic-device-checkboxes" style="max-height: 120px; overflow-y: auto;">加载设备中...</div>
-                            </div>
-                            <div id="admin-device-msg" style="display: none; color: var(--accent-green); font-size: 0.85rem; padding-top: 5px;">
-                                🛡️ 管理员将自动拥有全网所有设备的监控权限
+                            <label>账号角色</label>
+                            <div id="admin-device-msg" style="display: block; color: var(--accent-green); font-size: 0.85rem; padding-top: 5px;">
+                                🛡️ 云端后端当前只创建管理员本地账号，并自动授予全量设备监控权限
                             </div>
                         </div>
                         <button class="primary-btn" style="width: 100%;" onclick="createNewUser()">确认创建</button>

@@ -1,18 +1,10 @@
 const API_BASE_URL = "/api/v1";
-let sandboxSseConnection = null; // 新增：用于沙盘模型状态的实时流
+let sandboxSseConnection = null; // 用于沙盘模型状态的实时流
 window.boundDeviceMap = { edge: null, cloud: null };
 
-// 👇 新增 1：开启沙盘模型实时流
+// 开启沙盘模型实时流
 function startSandboxModelStream() {
     if (!localStorage.getItem('jwt_token')) return;
-
-    // 按需求：暂时只为普通用户开发，管理员直接提示
-    const role = localStorage.getItem('user_role');
-    if (role === 'admin') {
-        document.getElementById('active-models-container').innerHTML =
-            '<span style="color: #8b949e; font-size: 0.9rem;">管理员沙盘视图暂未开发，当前仅展示普通用户分配视角。</span>';
-        return;
-    }
 
     if (sandboxSseConnection) sandboxSseConnection.close();
 
@@ -30,7 +22,7 @@ function startSandboxModelStream() {
     };
 }
 
-// 👇 新增 2：提取并去重渲染模型徽章
+// 提取并去重渲染模型徽章
 function renderSandboxModels(nodes) {
     const container = document.getElementById('active-models-container');
     const availableModels = new Set();
@@ -132,6 +124,13 @@ async function handleLogin() {
         if (!res.ok) throw new Error("账号或密码错误");
         const data = await res.json();
 
+        if (data.role !== 'admin') {
+            localStorage.removeItem('jwt_token');
+            localStorage.removeItem('current_user');
+            localStorage.removeItem('user_role');
+            throw new Error("云端前端页面当前仅支持管理员登录");
+        }
+
         localStorage.setItem('jwt_token', data.access_token);
         localStorage.setItem('current_user', data.username);
         localStorage.setItem('user_role', data.role);
@@ -166,7 +165,7 @@ function openAdminModal() {
 
 function closeAdminModal() {
     document.getElementById("admin-modal-overlay").style.display = "none";
-    loadMyDevices();
+    loadSystemDevices();
 }
 
 async function refreshAllAdminData() {
@@ -178,21 +177,18 @@ async function refreshAllAdminData() {
 
 async function fetchDevices() {
     const tbody = document.getElementById("device-table-body");
-    const cbContainer = document.getElementById("dynamic-device-checkboxes");
     try {
         const res = await fetchWithAuth(`${API_BASE_URL}/system/devices`);
         const devices = await res.json();
-        tbody.innerHTML = ''; cbContainer.innerHTML = ''; systemDevicesMap = {};
+        tbody.innerHTML = ''; systemDevicesMap = {};
         devices.forEach(d => {
             systemDevicesMap[d.id] = d.name;
             tbody.innerHTML += `<tr>
                 <td style="font-weight:bold">${d.id}</td><td>${d.name}</td><td><code>${d.value}</code></td>
                 <td>${d.id !== 'cloud' ? `<span class="delete-btn" onclick="deleteDevice('${d.id}')">下线</span>` : '<span style="color:#666">保留</span>'}</td>
             </tr>`;
-            const isChecked = d.id === 'cloud' ? 'checked' : '';
-            cbContainer.innerHTML += `<label><input type="checkbox" class="device-check" value="${d.id}" data-type="${d.type}" ${isChecked}> ${d.name}</label>`;
         });
-    } catch (error) { cbContainer.innerHTML = '<span style="color:red">获取设备失败</span>'; }
+    } catch (error) {}
 }
 
 async function createNewDevice() {
@@ -232,69 +228,22 @@ async function fetchUsers() {
                 const name = systemDevicesMap[d] || d;
                 return `<span class="tag ${d !== 'cloud' ? 'edge' : ''}">${name.split('(')[0]}</span>`;
             }).join('');
-            const openwebuiId = u.openwebui_user_id
-                ? `<code>${u.openwebui_user_id}</code>`
-                : '<span style="color:#666">未绑定</span>';
             tbody.innerHTML += `<tr>
                 <td style="font-weight:bold; color:var(--text-bright);">${u.username}</td>
                 <td>${u.role === 'admin' ? '🛡️ Admin' : '👤 User'}</td>
-                <td>${openwebuiId}</td>
                 <td>${devicesHtml || '<span style="color:#666">无权限</span>'}</td>
                 <td>${u.username !== 'admin' ? `<span class="delete-btn" onclick="deleteUser('${u.username}')">删除</span>` : '<span style="color:#666">不可操作</span>'}</td>
             </tr>`;
         });
-    } catch (error) { tbody.innerHTML = `<tr><td colspan="5" style="color:red">加载失败: ${error.message}</td></tr>`; }
+    } catch (error) { tbody.innerHTML = `<tr><td colspan="4" style="color:red">加载失败: ${error.message}</td></tr>`; }
 }
 
-// 👇 1. 新增这个函数，用于控制下拉框切换时的页面效果
-function toggleDeviceSelection() {
-    const role = document.getElementById("new-role").value;
-    const checkboxArea = document.getElementById("device-selection-area");
-    const adminMsg = document.getElementById("admin-device-msg");
-
-    if (role === 'admin') {
-        checkboxArea.style.display = 'none'; // 隐藏复选框
-        adminMsg.style.display = 'block';    // 显示提示语
-    } else {
-        checkboxArea.style.display = 'block'; // 显示复选框
-        adminMsg.style.display = 'none';      // 隐藏提示语
-    }
-}
-
-// 👇 2. 替换原有的 createNewUser 函数
 async function createNewUser() {
     const username = document.getElementById("new-username").value;
     const password = document.getElementById("new-password").value;
-    const openwebuiUserId = document.getElementById("new-openwebui-user-id").value.trim();
-    const role = document.getElementById("new-role").value;
     const msgDiv = document.getElementById("add-user-msg");
 
     if (!username || !password) return msgDiv.innerHTML = '<span style="color:red">账号和密码必填</span>';
-
-    let checkedDevices = "";
-
-    // 只有在创建"普通用户"时，前端才去校验复选框
-    if (role === 'user') {
-        const checkedBoxes = Array.from(document.querySelectorAll('.device-check:checked'));
-        checkedDevices = checkedBoxes.map(cb => cb.value).join(',');
-
-        if (!checkedDevices) return msgDiv.innerHTML = '<span style="color:red">至少分配一台设备</span>';
-
-        let cloudCount = 0;
-        let edgeCount = 0;
-
-        checkedBoxes.forEach(cb => {
-            if (cb.getAttribute('data-type') === 'cloud') cloudCount++;
-            if (cb.getAttribute('data-type') === 'edge') edgeCount++;
-        });
-
-        if (cloudCount !== 1 || edgeCount !== 1) {
-            return msgDiv.innerHTML = '<span style="color:red">普通用户必须且只能分配 1个云端 和 1个边端设备</span>';
-        }
-    } else {
-        // 如果是管理员，前端随便传个占位符，因为后端会自动查全量设备去覆盖它
-        checkedDevices = "all_devices_assigned_by_backend";
-    }
 
     msgDiv.innerHTML = '创建中...';
     try {
@@ -303,15 +252,11 @@ async function createNewUser() {
             body: JSON.stringify({
                 username,
                 password,
-                role,
-                allowed_devices: checkedDevices,
-                openwebui_user_id: openwebuiUserId || null,
             })
         });
         msgDiv.innerHTML = '<span style="color:var(--accent-green)">✅ 创建成功！</span>';
         document.getElementById("new-username").value = "";
         document.getElementById("new-password").value = "";
-        document.getElementById("new-openwebui-user-id").value = "";
         fetchUsers();
     } catch (error) {
         msgDiv.innerHTML = `<span style="color:red">❌ ${error.message}</span>`;
@@ -328,16 +273,16 @@ async function deleteUser(username) {
 // ==========================================
 window.ipToDeviceMap = {}; // 🌟 新增：用于全局缓存 IP 到设备名称的映射字典
 
-async function loadMyDevices() {
+async function loadSystemDevices() {
     const selector = document.getElementById("custom-device-selector");
     selector.innerHTML = '<option value="">加载设备列表中...</option>';
     try {
-        const response = await fetchWithAuth(`${API_BASE_URL}/users/my_devices`);
-        const data = await response.json();
+        const response = await fetchWithAuth(`${API_BASE_URL}/system/devices`);
+        const devices = await response.json();
         selector.innerHTML = '';
         window.ipToDeviceMap = {};
         window.boundDeviceMap = { edge: null, cloud: null };
-        data.devices.forEach(device => {
+        devices.forEach(device => {
             const option = document.createElement("option");
             option.value = device.value;
             option.textContent = device.name;
@@ -380,11 +325,18 @@ function switchView(viewId, navElement) {
 }
 
 function initializeDashboard() {
+    const role = localStorage.getItem('user_role');
+    if (role !== 'admin') {
+        logout();
+        const errDiv = document.getElementById("login-error");
+        errDiv.textContent = "云端前端页面当前仅支持管理员登录";
+        return;
+    }
+
     document.getElementById("login-overlay").style.display = "none";
     document.getElementById("login-error").textContent = "";
 
     const username = localStorage.getItem('current_user');
-    const role = localStorage.getItem('user_role');
     document.getElementById("current-user-display").textContent = `👤 在线身份: ${username.toUpperCase()}`;
 
     if (role === 'admin') {
@@ -393,7 +345,7 @@ function initializeDashboard() {
         document.getElementById("admin-panel-btn").style.display = "none";
     }
 
-    loadMyDevices();
+    loadSystemDevices();
     // 👇 新增：启动模型状态流
     startSandboxModelStream();
 }

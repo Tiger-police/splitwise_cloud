@@ -10,10 +10,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import decode_token_to_username, get_current_user, get_db
+from app.api.deps import (
+    get_current_edge_session,
+    get_current_openwebui_user_id,
+    get_db,
+)
 from app.core.config import settings
+from app.core.security import decode_openwebui_access_token
 from app.db.database import SessionLocal
-from app.models.models import Device, ModelNode, ScheduleTask, User
+from app.models.models import Device, EdgeSession, ModelNode, ScheduleTask
 from app.schemas.schemas import (
     EdgeTriggerRequest,
     RuntimeProgressCallbackRequest,
@@ -200,6 +205,14 @@ def extract_ip(device_value: str) -> str | None:
     return ip_match.group(0) if ip_match else None
 
 
+def decode_query_token_to_openwebui_user_id(token: str) -> str:
+    payload = decode_openwebui_access_token(token)
+    external_user_id = payload.get(settings.OPENWEBUI_USER_ID_CLAIM)
+    if not isinstance(external_user_id, str) or not external_user_id.strip():
+        raise HTTPException(status_code=401, detail="OpenWebUI token 缺少可识别的用户唯一 ID")
+    return external_user_id.strip()
+
+
 def find_runtime_node(db: Session, device_id: str, model_key: str, node_role: str) -> ModelNode | None:
     candidates = (
         db.query(ModelNode)
@@ -251,7 +264,7 @@ async def dispatch_strategy_to_runtime(node: ModelNode, payload: dict) -> None:
         response.raise_for_status()
 
 
-async def process_schedule_task(task_id: str, username: str, trigger_payload: dict) -> None:
+async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_session_id: str, trigger_payload: dict) -> None:
     db = SessionLocal()
     try:
         task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
@@ -276,30 +289,29 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             cloud_message="等待切分策略计算完成",
         )
 
-        user = db.query(User).filter(User.username == username).first()
-        if not user or not user.allowed_devices:
-            fail_task(db, task, "未找到用户设备授权", f"未找到用户 {username} 或该用户未分配设备权限")
+        edge_session = (
+            db.query(EdgeSession)
+            .filter(
+                EdgeSession.session_id == edge_session_id,
+                EdgeSession.openwebui_user_id == openwebui_user_id,
+                EdgeSession.status == "active",
+            )
+            .first()
+        )
+        if not edge_session:
+            fail_task(db, task, "初始化会话不存在", f"未找到 session_id={edge_session_id} 对应的有效会话")
             return
 
-        allowed_keys = [device_id for device_id in user.allowed_devices.split(",") if device_id]
-        devices = db.query(Device).filter(Device.id.in_(allowed_keys)).all()
+        edge_device = db.query(Device).filter(Device.id == edge_session.edge_device_id).first()
+        cloud_device = db.query(Device).filter(Device.id == edge_session.cloud_device_id).first()
+        if not edge_device or not cloud_device:
+            fail_task(db, task, "会话设备信息缺失", "边端或云端设备在资产表中不存在")
+            return
 
-        cloud_ip = None
-        edge_ip = None
-        cloud_device_id = None
-        edge_device_id = None
-
-        for device in devices:
-            extracted_ip = extract_ip(device.value)
-            if not extracted_ip:
-                continue
-
-            if device.device_type == "cloud" and not cloud_ip:
-                cloud_ip = extracted_ip
-                cloud_device_id = device.id
-            elif device.device_type == "edge" and not edge_ip:
-                edge_ip = extracted_ip
-                edge_device_id = device.id
+        edge_device_id = edge_device.id
+        cloud_device_id = cloud_device.id
+        edge_ip = extract_ip(edge_device.value)
+        cloud_ip = extract_ip(cloud_device.value)
 
         update_task(
             db,
@@ -348,9 +360,9 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
         }
 
         logger.info(
-            "任务触发: task_id=%s, user=%s, model=%s, raw_input_json=%s",
+            "任务触发: task_id=%s, openwebui_user_id=%s, model=%s, raw_input_json=%s",
             task_id,
-            username,
+            openwebui_user_id,
             model_type,
             json.dumps(raw_input_json, ensure_ascii=False, indent=2),
         )
@@ -369,9 +381,9 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
         )
 
         logger.info(
-            "状态向量编码完成: task_id=%s, user=%s, model=%s, state_vector=%s",
+            "状态向量编码完成: task_id=%s, openwebui_user_id=%s, model=%s, state_vector=%s",
             task_id,
-            username,
+            openwebui_user_id,
             model_type,
             json.dumps(state_vector, ensure_ascii=False),
         )
@@ -517,13 +529,24 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
 @router.post("/trigger", response_model=ScheduleTaskAcceptedResponse, status_code=202, summary="接收边端触发，异步启动调度任务")
 async def collect_raw_json(
     request: EdgeTriggerRequest,
-    current_username: str = Depends(get_current_user),
+    current_openwebui_user_id: str = Depends(get_current_openwebui_user_id),
+    edge_session: EdgeSession = Depends(get_current_edge_session),
     db: Session = Depends(get_db),
 ):
+    if edge_session.cloud_device_id != "cloud":
+        raise HTTPException(status_code=400, detail="当前阶段仅支持固定云端设备 cloud")
+
+    edge_session.model_type = request.model_type
+    edge_session.updated_at = datetime.utcnow()
+    db.add(edge_session)
+    db.commit()
+    db.refresh(edge_session)
+
     task_id = str(uuid.uuid4())
     task = ScheduleTask(
         task_id=task_id,
-        username=current_username,
+        openwebui_user_id=current_openwebui_user_id,
+        edge_session_id=edge_session.session_id,
         model_type=request.model_type,
         status="accepted",
         phase="strategy",
@@ -540,7 +563,14 @@ async def collect_raw_json(
     db.add(task)
     db.commit()
 
-    asyncio.create_task(process_schedule_task(task_id, current_username, request.model_dump()))
+    asyncio.create_task(
+        process_schedule_task(
+            task_id,
+            current_openwebui_user_id,
+            edge_session.session_id,
+            request.model_dump(),
+        )
+    )
 
     return {
         "status": "accepted",
@@ -555,12 +585,12 @@ async def collect_raw_json(
 @router.get("/tasks/{task_id}", response_model=ScheduleTaskStatusResponse, summary="查询调度任务状态")
 async def get_schedule_task_status(
     task_id: str,
-    current_username: str = Depends(get_current_user),
+    current_openwebui_user_id: str = Depends(get_current_openwebui_user_id),
     db: Session = Depends(get_db),
 ):
     task = (
         db.query(ScheduleTask)
-        .filter(ScheduleTask.task_id == task_id, ScheduleTask.username == current_username)
+        .filter(ScheduleTask.task_id == task_id, ScheduleTask.openwebui_user_id == current_openwebui_user_id)
         .first()
     )
     if not task:
@@ -571,12 +601,12 @@ async def get_schedule_task_status(
 @router.get("/tasks/{task_id}/strategy", response_model=ScheduleTaskStrategyResponse, summary="获取调度任务的切分策略")
 async def get_schedule_task_strategy(
     task_id: str,
-    current_username: str = Depends(get_current_user),
+    current_openwebui_user_id: str = Depends(get_current_openwebui_user_id),
     db: Session = Depends(get_db),
 ):
     task = (
         db.query(ScheduleTask)
-        .filter(ScheduleTask.task_id == task_id, ScheduleTask.username == current_username)
+        .filter(ScheduleTask.task_id == task_id, ScheduleTask.openwebui_user_id == current_openwebui_user_id)
         .first()
     )
     if not task:
@@ -606,7 +636,7 @@ async def get_schedule_task_strategy(
 
 @router.get("/tasks/{task_id}/stream", summary="SSE 推送调度任务进度")
 async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
-    current_username = decode_token_to_username(token)
+    current_openwebui_user_id = decode_query_token_to_openwebui_user_id(token)
 
     async def event_generator():
         while True:
@@ -614,7 +644,10 @@ async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
             try:
                 task = (
                     db.query(ScheduleTask)
-                    .filter(ScheduleTask.task_id == task_id, ScheduleTask.username == current_username)
+                    .filter(
+                        ScheduleTask.task_id == task_id,
+                        ScheduleTask.openwebui_user_id == current_openwebui_user_id,
+                    )
                     .first()
                 )
                 if not task:

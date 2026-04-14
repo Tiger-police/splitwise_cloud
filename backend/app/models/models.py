@@ -51,6 +51,8 @@ class ScheduleTask(Base):
 
     task_id = Column(String, primary_key=True, index=True)
     username = Column(String, index=True)
+    openwebui_user_id = Column(String, index=True, nullable=True)
+    edge_session_id = Column(String, index=True, nullable=True)
     model_type = Column(String, index=True)
     status = Column(String, default="accepted")
     phase = Column(String, default="strategy")
@@ -69,6 +71,22 @@ class ScheduleTask(Base):
     error_detail = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class EdgeSession(Base):
+    __tablename__ = "edge_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, unique=True, index=True)
+    openwebui_user_id = Column(String, index=True)
+    edge_device_id = Column(String, index=True)
+    edge_ip = Column(String, index=True)
+    cloud_device_id = Column(String, index=True)
+    model_type = Column(String, nullable=True)
+    status = Column(String, default="active")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
 
 
 def run_lightweight_migrations():
@@ -114,6 +132,8 @@ def run_lightweight_migrations():
         if "schedule_tasks" in table_names:
             existing_columns = {col["name"] for col in inspector.get_columns("schedule_tasks")}
             schedule_task_patches = [
+                ("openwebui_user_id", "ALTER TABLE schedule_tasks ADD COLUMN openwebui_user_id VARCHAR"),
+                ("edge_session_id", "ALTER TABLE schedule_tasks ADD COLUMN edge_session_id VARCHAR"),
                 ("edge_message", "ALTER TABLE schedule_tasks ADD COLUMN edge_message VARCHAR DEFAULT '等待边端模型加载'"),
                 ("cloud_message", "ALTER TABLE schedule_tasks ADD COLUMN cloud_message VARCHAR DEFAULT '等待云端模型加载'"),
             ]
@@ -169,26 +189,10 @@ def init_db_data():
         db.add(admin)
         db.commit()
 
-    if not db.query(User).filter(User.username == "userA").first():
-        logger.info("🛠️ 首次启动：正在向数据库注入初始普通用户账号...")
-        userA = User(
-            username="userA",
-            openwebui_user_id="ow-userA",
-            hashed_password=get_password_hash("user123"),
-            role="user",
-            allowed_devices="cloud,edge_A"
-        )
-        db.add(userA)
-        db.commit()
-
     admin_user = db.query(User).filter(User.role == "admin").order_by(User.id.asc()).first()
-    user_a = db.query(User).filter(User.username == "userA").first()
     changed = False
     if admin_user and not admin_user.openwebui_user_id:
         admin_user.openwebui_user_id = "ow-admin"
-        changed = True
-    if user_a and not user_a.openwebui_user_id:
-        user_a.openwebui_user_id = "ow-userA"
         changed = True
     if changed:
         db.commit()

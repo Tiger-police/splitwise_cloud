@@ -1,22 +1,53 @@
 # 边端前端对接说明
 
-本文档说明基于 OpenWebUI 的边端前端，如何与云端调度后端完成对接。
+本文档说明基于 OpenWebUI 的边端前端，如何与云端调度后端完成当前版本的对接。
 
-当前前端只需要完成 4 件事：
+## 0. 新旧流程差异速览
+
+和旧版对接方式相比，当前版本有 4 个关键变化：
+
+1. 不再调用 `POST /api/v1/auth/exchange`
+   - 旧流程：先用 OpenWebUI token 换云端后端自己的业务 token
+   - 新流程：直接使用 OpenWebUI token，不再额外换 token
+
+2. 新增 `POST /api/v1/session/init`
+   - 旧流程：exchange 完 token 后直接发起调度
+   - 新流程：先初始化一次会话，拿到 `session_id`
+
+3. 发起调度时需要额外带 `Session-Id`
+   - 旧流程：`Authorization: Bearer <cloud_backend_token>`
+   - 新流程：`Authorization: Bearer <openwebui_token>` 加 `Session-Id: <session_id>`
+
+4. 前端不再负责设备相关信息
+   - 旧流程里虽然前端也没有直接传很多设备参数，但后端还存在旧的本地普通用户绑定思路
+   - 新流程中已经明确：
+     - 边端设备由后端根据请求来源 IP 自动识别
+     - 云端设备当前固定为 `10.144.144.2`
+
+如果边端前端同学之前是按旧版文档开发的，那么现在只需要记住一句话：
+
+**先用 OpenWebUI token 调 `/api/v1/session/init` 拿 `session_id`，后续再用 `openwebui_token + Session-Id` 调度即可。**
+
+当前前端只需要完成 5 件事：
 
 1. 从 OpenWebUI 读取当前 token
-2. 调用云端后端 `/api/v1/auth/exchange`
-3. 用换到的业务 token 发起调度任务
-4. 查询任务状态，并在需要时拉取切分策略
+2. 调用云端后端 `POST /api/v1/session/init`
+3. 保存返回的 `session_id`
+4. 用 OpenWebUI token + `Session-Id` 发起调度任务
+5. 查询任务状态，并在需要时拉取切分策略
 
 前端当前不需要负责：
 
 - 传 `username`
-- 决定边端和云端用哪两台设备
+- 传边端设备 ID
+- 选择云端设备
 - 直接与算法服务通信
 - 直接与边端/云端推理 runtime 通信
 
-这些都由云端调度后端负责。
+这些都由云端调度后端负责。当前版本中：
+
+- 边端设备：由云端后端根据请求来源 IP 自动识别
+- 云端设备：固定为 `cloud`，对应 IP `10.144.144.2`
 
 ## 1. 基本地址
 
@@ -38,12 +69,12 @@ http://10.144.144.2:8010
 
 1. 用户在 OpenWebUI 登录
 2. 前端读取 OpenWebUI token
-3. 调用 `/api/v1/auth/exchange`
-4. 保存返回的 `cloud_backend_token`
-5. 用户选择模型后，调用 `/api/v1/schedule/trigger`
+3. 调用 `POST /api/v1/session/init`
+4. 保存返回的 `session_id`
+5. 用户选择模型后，调用 `POST /api/v1/schedule/trigger`
 6. 拿到 `task_id`
-7. 轮询或订阅 `/api/v1/schedule/tasks/{task_id}`
-8. 当 `phase = "loading"` 时，如需展示切分策略，调用 `/api/v1/schedule/tasks/{task_id}/strategy`
+7. 轮询或订阅 `GET /api/v1/schedule/tasks/{task_id}` / `stream`
+8. 当 `phase = "loading"` 时，如需展示切分策略，调用 `GET /api/v1/schedule/tasks/{task_id}/strategy`
 9. 根据 `phase`、`status`、`edge_progress`、`cloud_progress`、`edge_message`、`cloud_message` 更新 UI
 
 ## 3. 时序图
@@ -57,10 +88,11 @@ sequenceDiagram
     participant EdgeRT as 边端推理Runtime
     participant CloudRT as 云端推理Runtime
 
-    EdgeUI->>Cloud: POST /api/v1/auth/exchange
-    Cloud-->>EdgeUI: cloud access_token
+    EdgeUI->>Cloud: POST /api/v1/session/init
+    Cloud-->>EdgeUI: session_id + edge_device + cloud_device
 
     EdgeUI->>Cloud: POST /api/v1/schedule/trigger
+    Note over EdgeUI,Cloud: Authorization: Bearer <openwebui_token>\nSession-Id: <session_id>
     Cloud-->>EdgeUI: 202 Accepted + task_id
 
     Cloud->>Algo: POST /api/calculate
@@ -77,43 +109,54 @@ sequenceDiagram
     EdgeUI->>Cloud: GET /api/v1/schedule/tasks/{task_id}/strategy
 ```
 
-## 4. Token Exchange 接口
+## 4. 初始化边端会话接口
 
 ### 接口
 
 ```http
-POST /api/v1/auth/exchange
+POST /api/v1/session/init
 ```
 
 ### 请求头
 
 ```http
-Content-Type: application/json
+Authorization: Bearer <openwebui_token>
 ```
 
 ### 请求体
 
-```json
-{
-  "openwebui_token": "<OpenWebUI 当前 token>"
-}
-```
+无请求体。
 
 ### 成功响应示例
 
 ```json
 {
-  "access_token": "<cloud_backend_token>",
-  "token_type": "bearer",
-  "username": "userA",
-  "role": "user"
+  "session_id": "530c57ad-df64-4eff-af80-f1f5339ce4ef",
+  "openwebui_user_id": "4c1edb00-2a96-4cea-9c30-45e0a7782ae7",
+  "openwebui_username": "alice",
+  "openwebui_role": "user",
+  "edge_device": {
+    "id": "edge_A",
+    "name": "边端 A",
+    "type": "edge",
+    "ip": "10.144.144.3"
+  },
+  "cloud_device": {
+    "id": "cloud",
+    "name": "云端主机",
+    "type": "cloud",
+    "ip": "10.144.144.2"
+  },
+  "message": "OpenWebUI token 校验通过，边端设备识别完成，会话初始化成功"
 }
 ```
 
 ### 说明
 
-- 后续调度相关接口都使用 `access_token`
-- 这里不需要前端再传 `username`
+- 这一步会完成 OpenWebUI token 验签
+- 这一步会根据请求来源 IP 自动识别边端设备
+- 这一步会返回本次后续请求要使用的 `session_id`
+- 当前阶段前端不需要自己传边端设备 ID
 
 ## 5. 发起调度任务接口
 
@@ -127,7 +170,8 @@ POST /api/v1/schedule/trigger
 
 ```http
 Content-Type: application/json
-Authorization: Bearer <cloud_backend_token>
+Authorization: Bearer <openwebui_token>
+Session-Id: <session_id>
 ```
 
 ### 请求体
@@ -145,6 +189,7 @@ Authorization: Bearer <cloud_backend_token>
   - `tinyllama`
   - `llama-3.2-3b`
 - 前端不需要再传 `edge_device`
+- 前端不需要再传 `cloud_device`
 - 前端不需要再传 `edge_storage_limit_gb`
 
 ### 成功响应示例
@@ -171,7 +216,7 @@ GET /api/v1/schedule/tasks/{task_id}
 ### 请求头
 
 ```http
-Authorization: Bearer <cloud_backend_token>
+Authorization: Bearer <openwebui_token>
 ```
 
 ### 响应示例
@@ -238,7 +283,7 @@ GET /api/v1/schedule/tasks/{task_id}/strategy
 ### 请求头
 
 ```http
-Authorization: Bearer <cloud_backend_token>
+Authorization: Bearer <openwebui_token>
 ```
 
 ### 调用时机
@@ -312,20 +357,20 @@ Authorization: Bearer <cloud_backend_token>
 ### 接口
 
 ```http
-GET /api/v1/schedule/tasks/{task_id}/stream?token=<cloud_backend_token>
+GET /api/v1/schedule/tasks/{task_id}/stream?token=<openwebui_token>
 ```
 
 ### 说明
 
-- 当前 SSE 通过 query 参数传 token
+- 当前 SSE 通过 query 参数传 OpenWebUI token
 - 如果前端暂时不想接 SSE，继续轮询也可以
 
 ### 示例
 
 ```javascript
-const token = localStorage.getItem("cloud_backend_token");
+const openwebuiToken = localStorage.getItem("openwebui_token");
 const source = new EventSource(
-  `http://10.144.144.2:8010/api/v1/schedule/tasks/${taskId}/stream?token=${encodeURIComponent(token)}`
+  `http://10.144.144.2:8010/api/v1/schedule/tasks/${taskId}/stream?token=${encodeURIComponent(openwebuiToken)}`
 );
 
 source.onmessage = (event) => {
@@ -392,25 +437,28 @@ status === "failed"
 ## 10. 最简前端示例
 
 ```javascript
-async function exchangeToken(openwebuiToken) {
-  const res = await fetch("http://10.144.144.2:8010/api/v1/auth/exchange", {
+async function initSession(openwebuiToken) {
+  const res = await fetch("http://10.144.144.2:8010/api/v1/session/init", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ openwebui_token: openwebuiToken })
+    headers: {
+      "Authorization": `Bearer ${openwebuiToken}`
+    }
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.detail || "token exchange 失败");
-  localStorage.setItem("cloud_backend_token", data.access_token);
+  if (!res.ok) throw new Error(data.detail || "session 初始化失败");
+  localStorage.setItem("edge_session_id", data.session_id);
   return data;
 }
 
 async function triggerTask(modelType) {
-  const token = localStorage.getItem("cloud_backend_token");
+  const openwebuiToken = localStorage.getItem("openwebui_token");
+  const sessionId = localStorage.getItem("edge_session_id");
   const res = await fetch("http://10.144.144.2:8010/api/v1/schedule/trigger", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`
+      "Authorization": `Bearer ${openwebuiToken}`,
+      "Session-Id": sessionId
     },
     body: JSON.stringify({ model_type: modelType })
   });
@@ -420,9 +468,11 @@ async function triggerTask(modelType) {
 }
 
 async function getTaskStatus(taskId) {
-  const token = localStorage.getItem("cloud_backend_token");
+  const openwebuiToken = localStorage.getItem("openwebui_token");
   const res = await fetch(`http://10.144.144.2:8010/api/v1/schedule/tasks/${taskId}`, {
-    headers: { "Authorization": `Bearer ${token}` }
+    headers: {
+      "Authorization": `Bearer ${openwebuiToken}`
+    }
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.detail || "获取任务状态失败");
@@ -430,9 +480,11 @@ async function getTaskStatus(taskId) {
 }
 
 async function getTaskStrategy(taskId) {
-  const token = localStorage.getItem("cloud_backend_token");
+  const openwebuiToken = localStorage.getItem("openwebui_token");
   const res = await fetch(`http://10.144.144.2:8010/api/v1/schedule/tasks/${taskId}/strategy`, {
-    headers: { "Authorization": `Bearer ${token}` }
+    headers: {
+      "Authorization": `Bearer ${openwebuiToken}`
+    }
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.detail || "获取切分策略失败");
@@ -443,11 +495,13 @@ async function getTaskStrategy(taskId) {
 ## 11. 常见错误
 
 - `401`
-  - token 无效、过期，或需要重新 exchange
+  - OpenWebUI token 无效、过期，或 `Session-Id` 与当前 token 不匹配
 - `400`
   - 参数错误或模型名不支持
 - `404`
-  - 任务不存在，或当前用户无权访问该任务
+  - 任务不存在，或当前 OpenWebUI 用户无权访问该任务
+- `409`
+  - 策略还未生成，过早拉取了 `/strategy`
 - `500`
   - 算法服务异常、推理节点下发失败或后端内部异常
 
@@ -456,9 +510,9 @@ async function getTaskStrategy(taskId) {
 边端前端现在只要完成下面这些，就能完成对接：
 
 1. 读取 OpenWebUI token
-2. 调 `/api/v1/auth/exchange`
-3. 保存 `cloud_backend_token`
-4. 调 `/api/v1/schedule/trigger`
-5. 查询 `/api/v1/schedule/tasks/{task_id}`
-6. 如需展示策略，在 `phase = "loading"` 后调 `/api/v1/schedule/tasks/{task_id}/strategy`
+2. 调 `POST /api/v1/session/init`
+3. 保存 `session_id`
+4. 调 `POST /api/v1/schedule/trigger`
+5. 查询 `GET /api/v1/schedule/tasks/{task_id}`
+6. 如需展示策略，在 `phase = "loading"` 后调 `GET /api/v1/schedule/tasks/{task_id}/strategy`
 7. 根据 `phase`、`status`、`message`、`edge_message`、`cloud_message`、`edge_progress`、`cloud_progress` 更新 UI
