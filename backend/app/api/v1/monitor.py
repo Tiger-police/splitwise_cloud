@@ -9,9 +9,10 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 
 from app.api.deps import get_db
+from app.core.config import settings
 from app.models.models import Device, ModelNode
 from app.schemas.schemas import ModelRegisterRequest, ModelUnregisterRequest
-from app.db.database import SessionLocal, session_scope
+from app.db.database import SessionLocal
 
 logger = logging.getLogger("MonitorRouter")
 router = APIRouter()
@@ -63,16 +64,17 @@ def infer_runtime_context(db: Session, ip_address: str, port: int) -> tuple[str,
             node_role = "cloud" if (device.device_type or "").lower() == "cloud" else "edge"
             return device.id, node_role
 
-    fallback = LOCAL_RUNTIME_FALLBACKS.get((ip_address, port))
-    if fallback:
-        logger.warning(
-            "⚠️ 当前使用本地 mock runtime 兜底映射: %s:%s -> device_id=%s, node_role=%s",
-            ip_address,
-            port,
-            fallback[0],
-            fallback[1],
-        )
-        return fallback
+    if settings.LOCAL_RUNTIME_FALLBACK_ENABLED:
+        fallback = LOCAL_RUNTIME_FALLBACKS.get((ip_address, port))
+        if fallback:
+            logger.warning(
+                "⚠️ 当前启用了本地 mock runtime 兜底映射: %s:%s -> device_id=%s, node_role=%s",
+                ip_address,
+                port,
+                fallback[0],
+                fallback[1],
+            )
+            return fallback
 
     raise ValueError(f"未找到 IP {ip_address} 对应的设备资产，请先在设备管理中录入该设备")
 
@@ -163,15 +165,20 @@ async def stream_models_status():
 
     async def event_generator():
         while True:
-            with session_scope() as db:
-                try:
-                    nodes = db.query(ModelNode).all()
-                    result = [serialize_model_node(cast(Any, n)) for n in nodes]
+            db = SessionLocal()
+            try:
+                nodes = db.query(ModelNode).all()
+                result = []
+                for n in nodes:
+                    result.append(serialize_model_node(cast(Any, n)))
 
-                    payload = json.dumps({"status": "success", "nodes": result})
-                    yield f"data: {payload}\n\n"
-                except Exception as e:
-                    logging.error(f"SSE 推送异常: {e}")
+                payload = json.dumps({"status": "success", "nodes": result})
+                yield f"data: {payload}\n\n"
+
+            except Exception as e:
+                logging.error(f"SSE 推送异常: {e}")
+            finally:
+                db.close()
 
             await asyncio.sleep(2)
 

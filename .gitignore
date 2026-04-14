@@ -31,3 +31,6 @@ data/*.sqlite3
 # ========================
 monitor/prometheus_data/
 monitor/grafana_data/
+
+
+next_stage_adjustment_plans/

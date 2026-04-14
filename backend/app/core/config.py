@@ -36,15 +36,23 @@ class Settings:
     )
     OPENWEBUI_EXPECTED_ISSUER: str = os.getenv("OPENWEBUI_EXPECTED_ISSUER", "")
     OPENWEBUI_EXPECTED_AUDIENCE: str = os.getenv("OPENWEBUI_EXPECTED_AUDIENCE", "")
+    LOCAL_RUNTIME_FALLBACK_ENABLED: bool = env_bool("LOCAL_RUNTIME_FALLBACK_ENABLED", False)
 
     # 服务器配置
     HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
     PORT: int = int(os.getenv("SERVER_PORT", 8010))
     PUBLIC_BASE_URL: str = os.getenv("SERVER_PUBLIC_BASE_URL", f"http://127.0.0.1:{PORT}")
+    ADMIN_USERNAME: str = os.getenv("ADMIN_USERNAME", "")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")
 
     # 外部服务配置
     PROMETHEUS_URL: str = os.getenv("PROMETHEUS_URL", "http://10.144.144.2:9090")
     ALGORITHM_API_URL: str = os.getenv("ALGORITHM_API_URL", "http://10.144.144.2:5000/api/calculate")
+    HEALTHCHECK_INTERVAL_SECONDS: float = float(os.getenv("HEALTHCHECK_INTERVAL_SECONDS", 10))
+    HEALTHCHECK_TIMEOUT_SECONDS: float = float(os.getenv("HEALTHCHECK_TIMEOUT_SECONDS", 3.0))
+    HEALTHCHECK_RETRY_COUNT: int = int(os.getenv("HEALTHCHECK_RETRY_COUNT", 1))
+    HEALTHCHECK_RETRY_DELAY_SECONDS: float = float(os.getenv("HEALTHCHECK_RETRY_DELAY_SECONDS", 0.5))
+    HEALTHCHECK_FAILURE_THRESHOLD: int = int(os.getenv("HEALTHCHECK_FAILURE_THRESHOLD", 3))
     NETWORK_PING_COUNT: int = int(os.getenv("NETWORK_PING_COUNT", 4))
     NETWORK_PING_TIMEOUT_SECONDS: float = float(os.getenv("NETWORK_PING_TIMEOUT_SECONDS", 1.0))
     NETWORK_ENABLE_IPERF3: bool = env_bool("NETWORK_ENABLE_IPERF3", False)

@@ -68,6 +68,14 @@ class LayerPartition(BaseModel):
     head_assignments: List[int]  # 0为边端，1为云端
     ffn_assignment: int          # 0为边端，1为云端，2为拆分
 
+
+class StrategyDisplayLayerPartition(BaseModel):
+    layer_id: int
+    head_assignments: List[int]
+    ffn_assignment: int
+    edge_head_count: int
+    cloud_head_count: int
+
 # 👇 新增：算法组回调我们接口时发送的总数据包
 class StrategyCallbackRequest(BaseModel):
     task_id: str                 # 极其重要：用于匹配是哪次触发请求
@@ -79,10 +87,15 @@ class RuntimeDecisionPayload(BaseModel):
     layer_partitions: List[LayerPartition]
 
 
+class StrategyDisplayDecisionPayload(BaseModel):
+    layer_partitions: List[StrategyDisplayLayerPartition]
+    edge_head_count_total: int
+    cloud_head_count_total: int
+
+
 class RuntimeDispatchRequest(BaseModel):
     task_id: str
     model_type: str
-    callback_url: str
     decision: RuntimeDecisionPayload
 
 
@@ -114,6 +127,14 @@ class ScheduleTaskStatusResponse(BaseModel):
     cloud_progress: int
     edge_status: str
     cloud_status: str
+    edge_message: str
+    cloud_message: str
     error_detail: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class ScheduleTaskStrategyResponse(BaseModel):
+    task_id: str
+    model_type: str
+    decision: StrategyDisplayDecisionPayload
