@@ -13,6 +13,7 @@ load_dotenv(PROJECT_ROOT / "backend" / ".env")
 EXCHANGE_URL = "http://127.0.0.1:8010/api/v1/auth/exchange"
 TRIGGER_URL = "http://127.0.0.1:8010/api/v1/schedule/trigger"
 TASK_URL_TEMPLATE = "http://127.0.0.1:8010/api/v1/schedule/tasks/{task_id}"
+STRATEGY_URL_TEMPLATE = "http://127.0.0.1:8010/api/v1/schedule/tasks/{task_id}/strategy"
 OPENWEBUI_JWT_SECRET = os.getenv("OPENWEBUI_JWT_SECRET", "")
 OPENWEBUI_JWT_ALGORITHM = os.getenv("OPENWEBUI_JWT_ALGORITHM", "HS256")
 OPENWEBUI_SKIP_SIGNATURE_VERIFY = os.getenv("OPENWEBUI_SKIP_SIGNATURE_VERIFY", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -71,6 +72,7 @@ try:
     print(f"📡 云端受理成功，task_id = {task_id}")
     print(json.dumps(accepted, indent=2, ensure_ascii=False))
 
+    strategy_fetched = False
     while True:
         task_response = requests.get(TASK_URL_TEMPLATE.format(task_id=task_id), headers=headers, timeout=10)
         task_response.raise_for_status()
@@ -80,8 +82,38 @@ try:
             f"phase={task_data['phase']} | "
             f"phase_progress={task_data['phase_progress']} | "
             f"overall_progress={task_data['overall_progress']} | "
-            f"message={task_data['message']}"
+            f"message={task_data['message']} | "
+            f"edge_message={task_data.get('edge_message')} | "
+            f"cloud_message={task_data.get('cloud_message')}"
         )
+
+        if task_data["phase"] == "loading" and not strategy_fetched:
+            strategy_response = requests.get(
+                STRATEGY_URL_TEMPLATE.format(task_id=task_id),
+                headers=headers,
+                timeout=10,
+            )
+            strategy_response.raise_for_status()
+            strategy_data = strategy_response.json()
+            print("🧩 已拉取切分策略:")
+            print(json.dumps(strategy_data, indent=2, ensure_ascii=False))
+
+            decision = strategy_data.get("decision", {})
+            print(
+                "🧮 全局统计 | "
+                f"edge_head_count_total={decision.get('edge_head_count_total')} | "
+                f"cloud_head_count_total={decision.get('cloud_head_count_total')}"
+            )
+
+            first_layer = strategy_data.get("decision", {}).get("layer_partitions", [{}])[0]
+            if first_layer:
+                print(
+                    "🧮 第 0 层统计 | "
+                    f"edge_head_count={first_layer.get('edge_head_count')} | "
+                    f"cloud_head_count={first_layer.get('cloud_head_count')} | "
+                    f"head_assignments_len={len(first_layer.get('head_assignments', []))}"
+                )
+            strategy_fetched = True
 
         if task_data["status"] in {"completed", "failed"}:
             print("📦 最终任务结果:")

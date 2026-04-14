@@ -1,7 +1,8 @@
 import logging
 from sqlalchemy import Column, Integer, String, DateTime, Text, inspect, text
 from datetime import datetime
-from app.db.database import Base, SessionLocal, engine, session_scope
+from app.db.database import Base, SessionLocal, engine
+from app.core.config import settings
 from app.core.security import get_password_hash
 
 logger = logging.getLogger("InitDB")
@@ -62,6 +63,8 @@ class ScheduleTask(Base):
     cloud_progress = Column(Integer, default=0)
     edge_status = Column(String, default="pending")
     cloud_status = Column(String, default="pending")
+    edge_message = Column(String, default="等待边端模型加载")
+    cloud_message = Column(String, default="等待云端模型加载")
     strategy_payload = Column(Text, nullable=True)
     error_detail = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -108,50 +111,86 @@ def run_lightweight_migrations():
                 "ON users (openwebui_user_id)"
             ))
 
+        if "schedule_tasks" in table_names:
+            existing_columns = {col["name"] for col in inspector.get_columns("schedule_tasks")}
+            schedule_task_patches = [
+                ("edge_message", "ALTER TABLE schedule_tasks ADD COLUMN edge_message VARCHAR DEFAULT '等待边端模型加载'"),
+                ("cloud_message", "ALTER TABLE schedule_tasks ADD COLUMN cloud_message VARCHAR DEFAULT '等待云端模型加载'"),
+            ]
+            for column_name, statement in schedule_task_patches:
+                if column_name not in existing_columns:
+                    logger.info("🧩 正在为 schedule_tasks 补充新字段: %s", column_name)
+                    conn.execute(text(statement))
+
+            conn.execute(
+                text(
+                    "UPDATE schedule_tasks SET edge_message = '等待边端模型加载' "
+                    "WHERE edge_message IS NULL OR edge_message = ''"
+                )
+            )
+            conn.execute(
+                text(
+                    "UPDATE schedule_tasks SET cloud_message = '等待云端模型加载' "
+                    "WHERE cloud_message IS NULL OR cloud_message = ''"
+                )
+            )
+
 
 def init_db_data():
     """
     系统首次启动时，检查并注入默认的物理设备和管理员账号
     """
-    with session_scope() as db:
-        if not db.query(Device).first():
-            logger.info("🛠️ 首次启动：正在向数据库注入默认物理设备资产...")
-            db.add_all([
-                Device(id="cloud", name="☁️ 云端总枢纽 (RTX 5090)", value="10.144.144.2:9400|10.144.144.2:9100",
-                       device_type="cloud"),
-                Device(id="edge_A", name="📱 边缘节点 A (RTX 4090)", value="10.144.144.3:9100|10.144.144.3:9400",
-                       device_type="edge"),
-                Device(id="edge_B", name="📱 边缘节点 B (RTX 3080)", value="10.144.144.4:9100|10.144.144.4:9400",
-                       device_type="edge")
-            ])
+    db = SessionLocal()
+    admin_username = (settings.ADMIN_USERNAME or "").strip() or "admin"
+    admin_password = settings.ADMIN_PASSWORD or "admin123"
 
-        if not db.query(User).filter(User.username == "admin").first():
-            logger.info("🛠️ 首次启动：正在向数据库注入初始管理员和普通用户账号...")
-            admin = User(
-                username="admin",
-                openwebui_user_id="ow-admin",
-                hashed_password=get_password_hash("admin123"),
-                role="admin",
-                allowed_devices="cloud,edge_A,edge_B"
-            )
-            userA = User(
-                username="userA",
-                openwebui_user_id="ow-userA",
-                hashed_password=get_password_hash("user123"),
-                role="user",
-                allowed_devices="cloud,edge_A"
-            )
-            db.add(admin)
-            db.add(userA)
-        else:
-            existing_users = db.query(User).filter(User.username.in_(["admin", "userA"])).all()
-            changed = False
-            for user in existing_users:
-                if user.username == "admin" and not user.openwebui_user_id:
-                    user.openwebui_user_id = "ow-admin"
-                    changed = True
-                if user.username == "userA" and not user.openwebui_user_id:
-                    user.openwebui_user_id = "ow-userA"
-                    changed = True
-            if changed:
-                db.add_all(existing_users)
+    if not db.query(Device).first():
+        logger.info("🛠️ 首次启动：正在向数据库注入默认物理设备资产...")
+        db.add_all([
+            Device(id="cloud", name="☁️ 云端总枢纽 (RTX 5090)", value="10.144.144.2:9400|10.144.144.2:9100",
+                   device_type="cloud"),
+            Device(id="edge_A", name="📱 边缘节点 A (RTX 4090)", value="10.144.144.3:9100|10.144.144.3:9400",
+                   device_type="edge"),
+            Device(id="edge_B", name="📱 边缘节点 B (RTX 3080)", value="10.144.144.4:9100|10.144.144.4:9400",
+                   device_type="edge")
+        ])
+        db.commit()
+
+    existing_admin = db.query(User).filter(User.role == "admin").first()
+    if not existing_admin:
+        logger.info("🛠️ 首次启动：正在向数据库注入初始管理员账号...")
+        admin = User(
+            username=admin_username,
+            openwebui_user_id="ow-admin",
+            hashed_password=get_password_hash(admin_password),
+            role="admin",
+            allowed_devices="cloud,edge_A,edge_B"
+        )
+        db.add(admin)
+        db.commit()
+
+    if not db.query(User).filter(User.username == "userA").first():
+        logger.info("🛠️ 首次启动：正在向数据库注入初始普通用户账号...")
+        userA = User(
+            username="userA",
+            openwebui_user_id="ow-userA",
+            hashed_password=get_password_hash("user123"),
+            role="user",
+            allowed_devices="cloud,edge_A"
+        )
+        db.add(userA)
+        db.commit()
+
+    admin_user = db.query(User).filter(User.role == "admin").order_by(User.id.asc()).first()
+    user_a = db.query(User).filter(User.username == "userA").first()
+    changed = False
+    if admin_user and not admin_user.openwebui_user_id:
+        admin_user.openwebui_user_id = "ow-admin"
+        changed = True
+    if user_a and not user_a.openwebui_user_id:
+        user_a.openwebui_user_id = "ow-userA"
+        changed = True
+    if changed:
+        db.commit()
+
+    db.close()

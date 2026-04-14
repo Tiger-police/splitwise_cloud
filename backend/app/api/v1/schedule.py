@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import re
-import shutil
 import uuid
 from datetime import datetime
 
@@ -13,22 +12,22 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import decode_token_to_username, get_current_user, get_db
 from app.core.config import settings
-from app.db.database import SessionLocal, session_scope
+from app.db.database import SessionLocal
 from app.models.models import Device, ModelNode, ScheduleTask, User
 from app.schemas.schemas import (
     EdgeTriggerRequest,
     RuntimeProgressCallbackRequest,
     ScheduleTaskAcceptedResponse,
+    ScheduleTaskStrategyResponse,
     ScheduleTaskStatusResponse,
     StrategyCallbackRequest,
 )
-from app.services.scheduler import encode_state
 from app.services.network_probe import get_network_metrics
 from app.services.prometheus_metrics import get_prometheus_metrics
-from app.services.task_queue import task_queue, TaskState
+from app.services.scheduler import encode_state
 
-PROMETHEUS_URL = settings.PROMETHEUS_URL
 TASK_TERMINAL_STATUSES = {"completed", "failed"}
+PENDING_STRATEGY_TASKS = {}
 
 router = APIRouter()
 logger = logging.getLogger("ScheduleRouter")
@@ -88,9 +87,36 @@ def serialize_task(task: ScheduleTask) -> dict:
         "cloud_progress": task.cloud_progress,
         "edge_status": task.edge_status,
         "cloud_status": task.cloud_status,
+        "edge_message": task.edge_message,
+        "cloud_message": task.cloud_message,
         "error_detail": task.error_detail,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+    }
+
+
+def build_strategy_display_layer_partitions(layer_partitions: list[dict]) -> list[dict]:
+    display_layers = []
+    for layer in layer_partitions:
+        head_assignments = list(layer.get("head_assignments", []))
+        edge_head_count = sum(1 for assignment in head_assignments if assignment == 0)
+        cloud_head_count = sum(1 for assignment in head_assignments if assignment == 1)
+        display_layers.append(
+            {
+                "layer_id": layer.get("layer_id"),
+                "head_assignments": head_assignments,
+                "ffn_assignment": layer.get("ffn_assignment"),
+                "edge_head_count": edge_head_count,
+                "cloud_head_count": cloud_head_count,
+            }
+        )
+    return display_layers
+
+
+def build_strategy_display_summary(display_layers: list[dict]) -> dict:
+    return {
+        "edge_head_count_total": sum(layer.get("edge_head_count", 0) for layer in display_layers),
+        "cloud_head_count_total": sum(layer.get("cloud_head_count", 0) for layer in display_layers),
     }
 
 
@@ -106,6 +132,8 @@ def update_task(
     cloud_progress: int | None = None,
     edge_status: str | None = None,
     cloud_status: str | None = None,
+    edge_message: str | None = None,
+    cloud_message: str | None = None,
     strategy_payload: str | None = None,
     error_detail: str | None = None,
     edge_device_id: str | None = None,
@@ -125,6 +153,10 @@ def update_task(
         task.edge_status = edge_status
     if cloud_status is not None:
         task.cloud_status = cloud_status
+    if edge_message is not None:
+        task.edge_message = edge_message
+    if cloud_message is not None:
+        task.cloud_message = cloud_message
     if strategy_payload is not None:
         task.strategy_payload = strategy_payload
     if error_detail is not None:
@@ -211,8 +243,6 @@ def derive_edge_storage_limit_gb_from_metrics(edge_metrics: dict) -> float:
     return round(gpu_available_mb / 1024.0, 2)
 
 
-
-
 async def dispatch_strategy_to_runtime(node: ModelNode, payload: dict) -> None:
     control_path = node.control_path or "/load_strategy"
     runtime_url = f"http://{node.ip_address}:{node.port}{control_path}"
@@ -242,6 +272,8 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             phase="strategy",
             phase_progress=5,
             message="正在校验用户权限并准备采集环境指标",
+            edge_message="等待切分策略计算完成",
+            cloud_message="等待切分策略计算完成",
         )
 
         user = db.query(User).filter(User.username == username).first()
@@ -351,8 +383,9 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             message="状态向量已生成，正在请求切分策略模型",
         )
 
-        # 标记任务为等待回调状态（替代 asyncio.Future）
-        task_queue.mark_task_waiting_callback(task_id, "strategy")
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        PENDING_STRATEGY_TASKS[task_id] = future
 
         payload_to_algorithm = {
             "task_id": task_id,
@@ -377,18 +410,7 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             message="切分策略模型已受理请求，等待算法回调",
         )
 
-        # 使用 task_queue 等待回调（替代 asyncio.wait_for(future)）
-        callback_received = await task_queue.wait_for_callback(task_id, timeout_seconds=30.0)
-        if not callback_received:
-            # 超时处理已在 task_queue 中完成
-            return
-
-        # 获取回调数据
-        decision_result = task_queue.get_callback_data(task_id)
-        if not decision_result:
-            fail_task(db, task, "策略回调数据解析失败", "无法从任务队列获取回调数据")
-            return
-
+        decision_result = await asyncio.wait_for(future, timeout=30.0)
         logger.info(
             "策略回调完成: task_id=%s, decision=%s",
             task_id,
@@ -424,23 +446,21 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             cloud_status="dispatching",
             edge_progress=0,
             cloud_progress=0,
+            edge_message="边端正在接收切分策略",
+            cloud_message="云端正在接收切分策略",
         )
 
-        edge_callback_url = f"{settings.PUBLIC_BASE_URL}/api/v1/schedule/runtime_callback/edge"
-        cloud_callback_url = f"{settings.PUBLIC_BASE_URL}/api/v1/schedule/runtime_callback/cloud"
         runtime_decision_payload = {
             "layer_partitions": decision_result["layer_partitions"],
         }
         edge_dispatch_payload = {
             "task_id": task_id,
             "model_type": model_type,
-            "callback_url": edge_callback_url,
             "decision": runtime_decision_payload,
         }
         cloud_dispatch_payload = {
             "task_id": task_id,
             "model_type": model_type,
-            "callback_url": cloud_callback_url,
             "decision": runtime_decision_payload,
         }
 
@@ -474,18 +494,23 @@ async def process_schedule_task(task_id: str, username: str, trigger_payload: di
             message="切分策略已下发，等待边云推理节点完成模型加载",
             edge_status="loading",
             cloud_status="loading",
+            edge_message="等待边端开始加载模型",
+            cloud_message="等待云端开始加载模型",
         )
 
+    except asyncio.TimeoutError:
+        if task_id in PENDING_STRATEGY_TASKS:
+            PENDING_STRATEGY_TASKS.pop(task_id, None)
+        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
+        if task:
+            fail_task(db, task, "等待算法组计算切分策略超时", "等待算法组计算切分策略超时 (30s)")
     except Exception as exc:
         logger.exception("调度任务执行异常: task_id=%s", task_id)
-        try:
-            task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-            if task:
-                fail_task(db, task, "调度任务执行失败", str(exc))
-        except Exception:
-            logger.exception("调度任务异常处理失败: task_id=%s", task_id)
-        if db.in_transaction():
-            db.rollback()
+        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
+        if task:
+            fail_task(db, task, "调度任务执行失败", str(exc))
+    finally:
+        PENDING_STRATEGY_TASKS.pop(task_id, None)
         db.close()
 
 
@@ -507,6 +532,8 @@ async def collect_raw_json(
         message="任务已受理，开始计算切分策略",
         edge_status="pending",
         cloud_status="pending",
+        edge_message="等待切分策略计算完成",
+        cloud_message="等待切分策略计算完成",
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
@@ -541,13 +568,50 @@ async def get_schedule_task_status(
     return serialize_task(task)
 
 
+@router.get("/tasks/{task_id}/strategy", response_model=ScheduleTaskStrategyResponse, summary="获取调度任务的切分策略")
+async def get_schedule_task_strategy(
+    task_id: str,
+    current_username: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    task = (
+        db.query(ScheduleTask)
+        .filter(ScheduleTask.task_id == task_id, ScheduleTask.username == current_username)
+        .first()
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="未找到该调度任务")
+    if not task.strategy_payload:
+        raise HTTPException(status_code=409, detail="切分策略尚未生成，请在进入 loading 阶段后再拉取")
+
+    try:
+        decision = json.loads(task.strategy_payload)
+    except json.JSONDecodeError as exc:
+        logger.exception("任务策略反序列化失败: task_id=%s", task_id)
+        raise HTTPException(status_code=500, detail="任务切分策略解析失败") from exc
+
+    display_layers = build_strategy_display_layer_partitions(decision.get("layer_partitions", []))
+    display_summary = build_strategy_display_summary(display_layers)
+
+    return {
+        "task_id": task.task_id,
+        "model_type": task.model_type,
+        "decision": {
+            "layer_partitions": display_layers,
+            "edge_head_count_total": display_summary["edge_head_count_total"],
+            "cloud_head_count_total": display_summary["cloud_head_count_total"],
+        },
+    }
+
+
 @router.get("/tasks/{task_id}/stream", summary="SSE 推送调度任务进度")
 async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
     current_username = decode_token_to_username(token)
 
     async def event_generator():
         while True:
-            with session_scope() as db:
+            db = SessionLocal()
+            try:
                 task = (
                     db.query(ScheduleTask)
                     .filter(ScheduleTask.task_id == task_id, ScheduleTask.username == current_username)
@@ -563,6 +627,8 @@ async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
 
                 if task.status in TASK_TERMINAL_STATUSES:
                     break
+            finally:
+                db.close()
 
             await asyncio.sleep(1)
 
@@ -572,25 +638,19 @@ async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
 @router.post("/strategy_callback", summary="【算法组专用】接收切分策略回调")
 async def receive_strategy_decision(payload: StrategyCallbackRequest):
     task_id = payload.task_id
-    
-    # 检查任务是否存在
-    with session_scope() as db:
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        if not task:
-            raise HTTPException(status_code=404, detail="未找到对应的任务ID，或任务已超时废弃")
+    if task_id not in PENDING_STRATEGY_TASKS:
+        raise HTTPException(status_code=404, detail="未找到对应的任务ID，或任务已超时废弃")
 
-    # 通知任务队列回调已到达
-    callback_data = payload.model_dump()
-    success = task_queue.notify_task_callback(task_id, callback_data=callback_data)
-    
-    if not success:
-        logger.warning("⚠️ 无法通知任务回调: task_id=%s", task_id)
+    future = PENDING_STRATEGY_TASKS[task_id]
+    if not future.done():
+        future.set_result(payload.model_dump())
 
     return {"status": "success", "message": f"任务 {task_id} 切分策略已成功接收并交付"}
 
 
 async def handle_runtime_progress(payload: RuntimeProgressCallbackRequest, callback_role: str | None = None):
-    with session_scope() as db:
+    db = SessionLocal()
+    try:
         task = db.query(ScheduleTask).filter(ScheduleTask.task_id == payload.task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="未找到对应的调度任务")
@@ -618,9 +678,11 @@ async def handle_runtime_progress(payload: RuntimeProgressCallbackRequest, callb
         if node_role == "edge":
             update_kwargs["edge_progress"] = progress
             update_kwargs["edge_status"] = node_status
+            update_kwargs["edge_message"] = payload.message
         else:
             update_kwargs["cloud_progress"] = progress
             update_kwargs["cloud_status"] = node_status
+            update_kwargs["cloud_message"] = payload.message
 
         task = update_task(db, task, **update_kwargs)
 
@@ -639,9 +701,13 @@ async def handle_runtime_progress(payload: RuntimeProgressCallbackRequest, callb
                 cloud_status="ready",
                 edge_progress=100,
                 cloud_progress=100,
+                edge_message="边端模型已加载完成",
+                cloud_message="云端模型已加载完成",
             )
 
         return {"status": "success", "message": "加载进度已记录"}
+    finally:
+        db.close()
 
 
 @router.post("/runtime_callback", summary="【推理节点专用】接收边云模型加载进度回调（兼容旧版）")

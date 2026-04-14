@@ -1,15 +1,7 @@
-"""网络探测与外部命令封装模块。
-
-本模块负责:
-- ping RTT/丢包探测
-- iperf3 带宽探测
-- 系统命令回退与解析
-- 结果缓存，避免频繁探测
-"""
+"""网络探测与缓存服务。"""
 import asyncio
 import json
 import logging
-import platform
 import re
 import shutil
 import time
@@ -21,7 +13,7 @@ logger = logging.getLogger("NetworkProbe")
 
 
 class ProbeCache:
-    """简单的 IP 对缓存，带 TTL。"""
+    """缓存边云 IP 对的网络指标结果。"""
 
     def __init__(self, ttl_seconds: float = 30.0):
         self.ttl_seconds = ttl_seconds
@@ -32,90 +24,79 @@ class ProbeCache:
         entry = self._cache.get(key)
         if not entry:
             return None
-        metrics, timestamp = entry
-        if time.monotonic() - timestamp > self.ttl_seconds:
+
+        metrics, ts = entry
+        if time.monotonic() - ts > self.ttl_seconds:
             self._cache.pop(key, None)
             return None
         return metrics
 
     def set(self, edge_ip: str, cloud_ip: str, metrics: dict) -> None:
-        key = (edge_ip, cloud_ip)
-        self._cache[key] = (metrics, time.monotonic())
+        self._cache[(edge_ip, cloud_ip)] = (metrics, time.monotonic())
 
     def clear(self) -> None:
         self._cache.clear()
 
 
 network_probe_cache = ProbeCache(ttl_seconds=settings.NETWORK_PROBE_CACHE_SECONDS)
+probe_semaphore = asyncio.Semaphore(max(1, settings.NETWORK_MAX_CONCURRENT_PROBES))
 
 
-def _build_system_ping_command(host: str, count: int, timeout: float) -> list[str]:
-    if platform.system().lower().startswith("win"):
-        # Windows ping timeout 单位为毫秒，-n 指定次数
-        return ["ping", "-n", str(count), "-w", str(int(timeout * 1000)), host]
-
-    return ["ping", "-c", str(count), "-W", str(max(1, int(timeout))), host]
-
-
-def _parse_system_ping_output(output: str) -> tuple[Optional[float], Optional[float]]:
-    packet_loss_match = re.search(r"(\d+(?:\.\d+)?)%[\s\S]*packet loss", output)
-    rtt_match = re.search(
-        r"(?:round-trip|rtt|平均|avg)[^\n]*= [^/]+/(\d+(?:\.\d+)?)/",
-        output,
-    )
-    if not packet_loss_match or not rtt_match:
-        return None, None
-
-    try:
-        avg_rtt = round(float(rtt_match.group(1)), 2)
-        packet_loss = round(float(packet_loss_match.group(1)), 2)
-        return avg_rtt, packet_loss
-    except ValueError:
-        return None, None
-
-
-async def _run_subprocess(cmd: list[str], timeout: float) -> tuple[str, str, int]:
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    return stdout.decode("utf-8", errors="ignore"), stderr.decode("utf-8", errors="ignore"), process.returncode
-
-
-async def ping_host_with_system_ping(host: str, count: int, timeout: float) -> tuple[Optional[float], Optional[float]]:
+async def ping_host_with_system_ping(host: str, count: int, timeout: float) -> tuple[float | None, float | None]:
     if not shutil.which("ping"):
         logger.info("未检测到系统 ping 命令，网络 RTT 探测将回退到默认值")
         return None, None
 
-    cmd = _build_system_ping_command(host, count, timeout)
+    cmd = [
+        "ping",
+        "-c",
+        str(count),
+        "-W",
+        str(max(1, int(timeout))),
+        host,
+    ]
+    process = None
     try:
-        output, stderr, returncode = await _run_subprocess(cmd, timeout=(count * timeout) + 2)
-        if returncode not in {0, 1}:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=(count * timeout) + 2)
+        output = (stdout or b"").decode("utf-8", errors="ignore")
+        if process.returncode not in {0, 1}:
             logger.warning(
                 "系统 ping 执行失败，已回退到默认值: host=%s, returncode=%s, stderr=%s",
                 host,
-                returncode,
-                stderr.strip(),
+                process.returncode,
+                (stderr or b"").decode("utf-8", errors="ignore").strip(),
             )
             return None, None
 
-        rtt, loss = _parse_system_ping_output(output)
-        if rtt is None or loss is None:
+        packet_loss_match = re.search(r"(\d+(?:\.\d+)?)%\s+packet loss", output)
+        rtt_match = re.search(
+            r"rtt min/avg/max(?:/mdev)? = \d+(?:\.\d+)?/(\d+(?:\.\d+)?)/",
+            output,
+        )
+        if not packet_loss_match or not rtt_match:
             logger.warning("系统 ping 输出无法解析，已回退到默认值: host=%s, output=%s", host, output.strip())
             return None, None
 
-        return rtt, loss
+        avg_rtt = round(float(rtt_match.group(1)), 2)
+        packet_loss = round(float(packet_loss_match.group(1)), 2)
+        return avg_rtt, packet_loss
     except asyncio.TimeoutError:
         logger.warning("系统 ping 超时，已回退到默认值: host=%s", host)
+        if process and process.returncode is None:
+            process.kill()
+            await process.communicate()
         return None, None
     except Exception as exc:
         logger.warning("系统 ping 探测失败，已回退到默认值: host=%s, error=%s", host, exc)
         return None, None
 
 
-async def ping_host(host: str, count: int, timeout: float) -> tuple[Optional[float], Optional[float]]:
+async def ping_host(host: str, count: int, timeout: float) -> tuple[float | None, float | None]:
     try:
         from ping3 import ping
     except ImportError:
@@ -125,7 +106,6 @@ async def ping_host(host: str, count: int, timeout: float) -> tuple[Optional[flo
     rtts: list[float] = []
     lost = 0
     hard_failure = False
-
     for _ in range(count):
         try:
             result = await asyncio.to_thread(ping, host, timeout=timeout, unit="ms")
@@ -166,23 +146,33 @@ async def measure_bandwidth(target_ip: str) -> float:
         str(settings.NETWORK_IPERF3_DURATION_SECONDS),
         "--json",
     ]
+    process = None
     try:
-        output, stderr, returncode = await _run_subprocess(cmd, timeout=settings.NETWORK_IPERF3_DURATION_SECONDS + 2)
-        if returncode != 0:
-            logger.warning("iperf3 返回非零，回退默认值: target_ip=%s, stderr=%s", target_ip, stderr.strip())
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=settings.NETWORK_IPERF3_DURATION_SECONDS + 2,
+        )
+        if process.returncode != 0:
             return 0.0
 
-        payload = json.loads(output)
+        payload = json.loads(stdout.decode("utf-8"))
         bits_per_second = payload.get("end", {}).get("sum_received", {}).get("bits_per_second")
         if bits_per_second is None:
             bits_per_second = payload.get("end", {}).get("sum_sent", {}).get("bits_per_second")
         if bits_per_second is None:
-            logger.warning("iperf3 输出缺少带宽信息，回退默认值: target_ip=%s", target_ip)
             return 0.0
 
         return round(float(bits_per_second) / 1_000_000.0, 2)
     except asyncio.TimeoutError:
         logger.warning("iperf3 带宽探测超时，已回退到默认值: target_ip=%s", target_ip)
+        if process and process.returncode is None:
+            process.kill()
+            await process.communicate()
         return 0.0
     except Exception as exc:
         logger.warning("iperf3 带宽探测失败，已回退到默认值: target_ip=%s, error=%s", target_ip, exc)
@@ -198,11 +188,12 @@ async def compute_network_metrics(edge_ip: str, cloud_ip: str) -> dict:
         "packet_loss": settings.NETWORK_DEFAULT_PACKET_LOSS,
     }
 
-    edge_ping, cloud_ping, bandwidth = await asyncio.gather(
-        ping_host(edge_ip, settings.NETWORK_PING_COUNT, settings.NETWORK_PING_TIMEOUT_SECONDS),
-        ping_host(cloud_ip, settings.NETWORK_PING_COUNT, settings.NETWORK_PING_TIMEOUT_SECONDS),
-        measure_bandwidth(edge_ip),
-    )
+    async with probe_semaphore:
+        edge_ping, cloud_ping, bandwidth = await asyncio.gather(
+            ping_host(edge_ip, settings.NETWORK_PING_COUNT, settings.NETWORK_PING_TIMEOUT_SECONDS),
+            ping_host(cloud_ip, settings.NETWORK_PING_COUNT, settings.NETWORK_PING_TIMEOUT_SECONDS),
+            measure_bandwidth(edge_ip),
+        )
 
     edge_rtt, edge_loss = edge_ping
     cloud_rtt, cloud_loss = cloud_ping

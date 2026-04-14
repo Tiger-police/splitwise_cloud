@@ -1,4 +1,3 @@
-import os
 from contextlib import contextmanager
 from pathlib import Path
 from sqlalchemy import create_engine
@@ -31,7 +30,7 @@ def session_scope():
     try:
         yield db
         db.commit()
-    except:
+    except Exception:
         db.rollback()
         raise
     finally:
