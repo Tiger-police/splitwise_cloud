@@ -1,10 +1,13 @@
-from fastapi import Depends, HTTPException
+from datetime import datetime
+
+from fastapi import Depends, Header, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jwt import PyJWTError
 
-from app.core.security import decode_internal_access_token
+from app.core.config import settings
+from app.core.security import decode_internal_access_token, decode_openwebui_access_token
 from app.db.database import SessionLocal
-from app.models.models import User
+from app.models.models import Device, EdgeSession, User
 
 security = HTTPBearer()
 
@@ -30,6 +33,100 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     """基础门禁：校验 Token"""
     token = credentials.credentials
     return decode_token_to_username(token)
+
+
+async def get_current_openwebui_payload(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    token = credentials.credentials
+    try:
+        return decode_openwebui_access_token(token)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="OpenWebUI token 无效或已过期") from exc
+
+
+async def get_current_openwebui_user_id(
+    payload: dict = Depends(get_current_openwebui_payload),
+):
+    external_user_id = payload.get(settings.OPENWEBUI_USER_ID_CLAIM)
+    if not isinstance(external_user_id, str) or not external_user_id.strip():
+        raise HTTPException(status_code=401, detail="OpenWebUI token 缺少可识别的用户唯一 ID")
+    return external_user_id.strip()
+
+
+def get_request_ip(request: Request) -> str:
+    if not request.client or not request.client.host:
+        raise HTTPException(status_code=400, detail="无法识别请求来源 IP")
+    return request.client.host
+
+
+def extract_ips(device_value: str | None) -> list[str]:
+    if not device_value:
+        return []
+    parts = device_value.replace("|", ",").split(",")
+    results: list[str] = []
+    for part in parts:
+        candidate = part.strip()
+        if not candidate:
+            continue
+        host = candidate.split(":")[0].strip()
+        if host:
+            results.append(host)
+    return results
+
+
+def resolve_edge_device_by_request_ip(request: Request, db) -> Device:
+    request_ip = get_request_ip(request)
+    devices = db.query(Device).filter(Device.device_type == "edge").all()
+    for device in devices:
+        if request_ip in extract_ips(device.value):
+            return device
+
+    if settings.LOCAL_RUNTIME_FALLBACK_ENABLED and request_ip in {"127.0.0.1", "::1"}:
+        fallback_device = db.query(Device).filter(Device.id == "edge_A").first()
+        if fallback_device:
+            return fallback_device
+
+    raise HTTPException(status_code=403, detail=f"请求来源 IP {request_ip} 未匹配到已登记的边端设备")
+
+
+async def get_current_edge_session(
+    request: Request,
+    db = Depends(get_db),
+    openwebui_user_id: str = Depends(get_current_openwebui_user_id),
+    session_id: str = Header(..., alias="Session-Id"),
+):
+    edge_session = (
+        db.query(EdgeSession)
+        .filter(
+            EdgeSession.session_id == session_id,
+            EdgeSession.status == "active",
+        )
+        .first()
+    )
+    if not edge_session:
+        raise HTTPException(status_code=401, detail="会话不存在或已失效，请重新初始化")
+
+    if edge_session.openwebui_user_id != openwebui_user_id:
+        raise HTTPException(status_code=403, detail="会话所属用户与当前 OpenWebUI token 不一致")
+
+    request_ip = get_request_ip(request)
+    if edge_session.edge_ip != request_ip:
+        raise HTTPException(status_code=403, detail="当前请求来源 IP 与初始化会话不一致")
+
+    if edge_session.expires_at <= datetime.utcnow():
+        edge_session.status = "expired"
+        db.add(edge_session)
+        db.commit()
+        raise HTTPException(status_code=401, detail="会话已过期，请重新初始化")
+
+    edge_session.updated_at = datetime.utcnow()
+    db.add(edge_session)
+    db.commit()
+    db.refresh(edge_session)
+    return edge_session
 
 async def get_current_admin(
     username: str = Depends(get_current_user),

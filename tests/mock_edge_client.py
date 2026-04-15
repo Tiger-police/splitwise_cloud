@@ -10,16 +10,16 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / "backend" / ".env")
 
-EXCHANGE_URL = "http://127.0.0.1:8010/api/v1/auth/exchange"
+SESSION_INIT_URL = "http://127.0.0.1:8010/api/v1/session/init"
 TRIGGER_URL = "http://127.0.0.1:8010/api/v1/schedule/trigger"
 TASK_URL_TEMPLATE = "http://127.0.0.1:8010/api/v1/schedule/tasks/{task_id}"
 STRATEGY_URL_TEMPLATE = "http://127.0.0.1:8010/api/v1/schedule/tasks/{task_id}/strategy"
 OPENWEBUI_JWT_SECRET = os.getenv("OPENWEBUI_JWT_SECRET", "")
 OPENWEBUI_JWT_ALGORITHM = os.getenv("OPENWEBUI_JWT_ALGORITHM", "HS256")
 OPENWEBUI_SKIP_SIGNATURE_VERIFY = os.getenv("OPENWEBUI_SKIP_SIGNATURE_VERIFY", "").strip().lower() in {"1", "true", "yes", "on"}
-# 默认使用本地种子数据中已绑定到 userA 的 OpenWebUI ID。
+# 默认使用一个独立的模拟 OpenWebUI 用户 ID。
 # 如果需要联调真实 OpenWebUI 用户，可通过环境变量 OPENWEBUI_MOCK_USER_ID 覆盖。
-OPENWEBUI_MOCK_USER_ID = os.getenv("OPENWEBUI_MOCK_USER_ID", "ow-userA")
+OPENWEBUI_MOCK_USER_ID = os.getenv("OPENWEBUI_MOCK_USER_ID", "mock-openwebui-user")
 OPENWEBUI_MOCK_EXPIRE_SECONDS = int(os.getenv("OPENWEBUI_MOCK_EXPIRE_SECONDS", "3600"))
 
 payload = {
@@ -41,7 +41,7 @@ def build_mock_openwebui_token(openwebui_user_id: str) -> str:
         )
 
     if not OPENWEBUI_JWT_SECRET:
-        raise RuntimeError("请先设置环境变量 OPENWEBUI_JWT_SECRET，再运行 token exchange 联调脚本")
+        raise RuntimeError("请先设置环境变量 OPENWEBUI_JWT_SECRET，再运行 OpenWebUI token 联调脚本")
 
     return jwt.encode(
         claims,
@@ -50,19 +50,27 @@ def build_mock_openwebui_token(openwebui_user_id: str) -> str:
     )
 
 
-print("🚀 边缘端正在使用 OpenWebUI token 进行 exchange，并发送推理触发请求...")
+print("🚀 边缘端正在使用 OpenWebUI token 初始化会话，并发送推理触发请求...")
 try:
     openwebui_token = build_mock_openwebui_token(OPENWEBUI_MOCK_USER_ID)
 
-    exchange_response = requests.post(
-        EXCHANGE_URL,
-        json={"openwebui_token": openwebui_token},
+    auth_headers = {"Authorization": f"Bearer {openwebui_token}"}
+
+    init_response = requests.post(
+        SESSION_INIT_URL,
+        headers=auth_headers,
         timeout=10,
     )
-    exchange_response.raise_for_status()
-    access_token = exchange_response.json()["access_token"]
+    init_response.raise_for_status()
+    init_data = init_response.json()
+    session_id = init_data["session_id"]
+    print("🧭 会话初始化成功:")
+    print(json.dumps(init_data, indent=2, ensure_ascii=False))
 
-    headers = {"Authorization": f"Bearer {access_token}"}
+    headers = {
+        **auth_headers,
+        "Session-Id": session_id,
+    }
 
     response = requests.post(TRIGGER_URL, json=payload, headers=headers, timeout=10)
     response.raise_for_status()
@@ -74,7 +82,11 @@ try:
 
     strategy_fetched = False
     while True:
-        task_response = requests.get(TASK_URL_TEMPLATE.format(task_id=task_id), headers=headers, timeout=10)
+        task_response = requests.get(
+            TASK_URL_TEMPLATE.format(task_id=task_id),
+            headers=auth_headers,
+            timeout=10,
+        )
         task_response.raise_for_status()
         task_data = task_response.json()
         print(
@@ -90,7 +102,7 @@ try:
         if task_data["phase"] == "loading" and not strategy_fetched:
             strategy_response = requests.get(
                 STRATEGY_URL_TEMPLATE.format(task_id=task_id),
-                headers=headers,
+                headers=auth_headers,
                 timeout=10,
             )
             strategy_response.raise_for_status()

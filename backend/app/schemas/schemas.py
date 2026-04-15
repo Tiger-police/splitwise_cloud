@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Literal
 from pydantic import BaseModel
 
 class EdgeStateRequest(BaseModel):
@@ -30,26 +30,26 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class TokenExchangeRequest(BaseModel):
-    openwebui_token: str
-
-
 class AuthTokenResponse(BaseModel):
     access_token: str
     token_type: str
     username: str
     role: str
 
+
+class SessionInitResponse(BaseModel):
+    session_id: Optional[str] = None
+    openwebui_user_id: str
+    openwebui_username: Optional[str] = None
+    openwebui_role: Optional[str] = None
+    edge_device: Optional[dict] = None
+    cloud_device: Optional[dict] = None
+    message: str
+
 class UserCreate(BaseModel):
     username: str
     password: str
-    role: str = "user"
-    allowed_devices: str = "cloud"
-    openwebui_user_id: Optional[str] = None
-
-
-class UserOpenWebUIBindingUpdate(BaseModel):
-    openwebui_user_id: str
+    role: Literal["admin"] = "admin"
 
 class DeviceCreate(BaseModel):
     id: str

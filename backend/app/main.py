@@ -8,7 +8,7 @@ from app.core.lifespan import lifespan
 from app.web import dashboard
 
 # 导入我们的 4 大战区
-from app.api.v1 import auth, users, devices, monitor, schedule
+from app.api.v1 import auth, users, devices, monitor, schedule, session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
@@ -27,6 +27,7 @@ def create_app() -> FastAPI:
 
     # 像拼图一样，把各战区路由挂载到总司令部
     app.include_router(auth.router, prefix="/api/v1", tags=["认证"])
+    app.include_router(session.router, prefix="/api/v1", tags=["普通用户会话"])
     app.include_router(users.router, prefix="/api/v1/users", tags=["账号管理"])
     app.include_router(devices.router, prefix="/api/v1/system/devices", tags=["设备管理"])
     app.include_router(monitor.router, prefix="/api/v1", tags=["云边监控"])
