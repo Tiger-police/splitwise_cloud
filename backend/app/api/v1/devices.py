@@ -20,15 +20,6 @@ async def create_device(dev_in: DeviceCreate, admin_user: User = Depends(get_cur
 
     db.add(Device(id=dev_in.id, name=dev_in.name, value=dev_in.value, device_type=dev_in.device_type))
 
-    # 自动授权给所有 admin
-    admins = db.query(User).filter(User.role == "admin").all()
-    for admin in admins:
-        if admin.allowed_devices:
-            if dev_in.id not in admin.allowed_devices.split(","):
-                admin.allowed_devices += f",{dev_in.id}"
-        else:
-            admin.allowed_devices = dev_in.id
-
     db.commit()
     return {"status": "success", "message": "设备录入成功"}
 
@@ -42,14 +33,6 @@ async def delete_device(device_id: str, admin_user: User = Depends(get_current_a
         raise HTTPException(status_code=404, detail="未找到设备")
 
     db.delete(dev)
-
-    # 级联清理普通用户的残留权限
-    for u in db.query(User).all():
-        if u.allowed_devices:
-            keys = u.allowed_devices.split(",")
-            if device_id in keys:
-                keys.remove(device_id)
-                u.allowed_devices = ",".join(keys)
 
     db.commit()
     return {"status": "success"}

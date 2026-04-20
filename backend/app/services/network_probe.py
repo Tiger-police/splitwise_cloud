@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import math
 import re
 import shutil
 import time
@@ -106,9 +107,10 @@ async def ping_host(host: str, count: int, timeout: float) -> tuple[float | None
     rtts: list[float] = []
     lost = 0
     hard_failure = False
+    ping_timeout_seconds = max(1, math.ceil(timeout))
     for _ in range(count):
         try:
-            result = await asyncio.to_thread(ping, host, timeout=timeout, unit="ms")
+            result = await asyncio.to_thread(ping, host, timeout=ping_timeout_seconds, unit="ms")
             if result is None:
                 lost += 1
             else:

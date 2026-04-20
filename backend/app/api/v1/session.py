@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -9,28 +9,27 @@ from app.api.deps import (
     get_current_openwebui_payload,
     get_current_openwebui_user_id,
     get_db,
-    get_request_ip,
-    resolve_edge_device_by_request_ip,
+    resolve_edge_device_by_ip,
 )
 from app.models.models import Device, EdgeSession
 from app.core.security import extract_claim
 from app.core.config import settings
-from app.schemas.schemas import SessionInitResponse
+from app.schemas.schemas import SessionInitRequest, SessionInitResponse
 
 router = APIRouter()
 
 
 @router.post("/session/init", response_model=SessionInitResponse, summary="使用 OpenWebUI token 初始化普通用户会话")
 async def init_openwebui_session(
-    request: Request,
+    payload: SessionInitRequest,
     openwebui_payload: dict = Depends(get_current_openwebui_payload),
     openwebui_user_id: str = Depends(get_current_openwebui_user_id),
     db: Session = Depends(get_db),
 ):
     openwebui_username = extract_claim(openwebui_payload, settings.OPENWEBUI_USERNAME_CLAIMS)
     openwebui_role = extract_claim(openwebui_payload, settings.OPENWEBUI_ROLE_CLAIMS)
-    edge_device = resolve_edge_device_by_request_ip(request, db)
-    request_ip = get_request_ip(request)
+    edge_ip = payload.edge_device_ip.strip()
+    edge_device = resolve_edge_device_by_ip(edge_ip, db)
     cloud_device = db.query(Device).filter(Device.id == "cloud").first()
     if not cloud_device:
         raise HTTPException(status_code=500, detail="未找到固定云端设备 cloud")
@@ -44,7 +43,7 @@ async def init_openwebui_session(
         .filter(
             EdgeSession.openwebui_user_id == openwebui_user_id,
             EdgeSession.edge_device_id == edge_device.id,
-            EdgeSession.edge_ip == request_ip,
+            EdgeSession.edge_ip == edge_ip,
             EdgeSession.status == "active",
             EdgeSession.expires_at > now,
         )
@@ -65,7 +64,7 @@ async def init_openwebui_session(
             session_id=str(uuid.uuid4()),
             openwebui_user_id=openwebui_user_id,
             edge_device_id=edge_device.id,
-            edge_ip=request_ip,
+            edge_ip=edge_ip,
             cloud_device_id="cloud",
             model_type=None,
             status="active",
@@ -87,7 +86,7 @@ async def init_openwebui_session(
             "id": edge_device.id,
             "name": edge_device.name,
             "type": edge_device.device_type,
-            "ip": request_ip,
+            "ip": edge_ip,
         },
         "cloud_device": {
             "id": cloud_device.id,

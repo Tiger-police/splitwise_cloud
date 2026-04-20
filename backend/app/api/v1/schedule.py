@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import re
 import uuid
 from datetime import datetime
 
@@ -18,7 +17,7 @@ from app.api.deps import (
 from app.core.config import settings
 from app.core.security import decode_openwebui_access_token
 from app.db.database import SessionLocal
-from app.models.models import Device, EdgeSession, ModelNode, ScheduleTask
+from app.models.models import Device, EdgeSession, ScheduleTask
 from app.schemas.schemas import (
     EdgeTriggerRequest,
     RuntimeProgressCallbackRequest,
@@ -27,182 +26,34 @@ from app.schemas.schemas import (
     ScheduleTaskStatusResponse,
     StrategyCallbackRequest,
 )
+from app.services.model_registry import MODEL_REGISTRY
 from app.services.network_probe import get_network_metrics
 from app.services.prometheus_metrics import get_prometheus_metrics
+from app.services.runtime_dispatcher import (
+    dispatch_strategy_to_runtime,
+    extract_ip,
+    find_runtime_node,
+)
+from app.services.schedule_presenter import (
+    build_strategy_display_layer_partitions,
+    build_strategy_display_summary,
+    clamp_progress,
+    serialize_task,
+)
+from app.services.schedule_queue import (
+    build_logical_queue_metrics,
+    count_queued_tasks_for_device_pair,
+    find_active_task_for_device_pair,
+    recalculate_queue_positions_for_device_pair,
+)
 from app.services.scheduler import encode_state
+from app.services.schedule_task_service import fail_task, update_task
 
 TASK_TERMINAL_STATUSES = {"completed", "failed"}
 PENDING_STRATEGY_TASKS = {}
 
 router = APIRouter()
 logger = logging.getLogger("ScheduleRouter")
-
-MODEL_REGISTRY = {
-    "gpt2": {
-        "architecture": "gpt2",
-        "num_hidden_layers": 12,
-        "num_attention_heads": 12,
-        "hidden_size": 768,
-        "intermediate_size": 3072,
-        "vocab_size": 50257,
-    },
-    "tinyllama": {
-        "architecture": "llama",
-        "num_hidden_layers": 22,
-        "num_attention_heads": 32,
-        "hidden_size": 2048,
-        "intermediate_size": 5632,
-        "vocab_size": 32000,
-    },
-    "llama-3.2-3b": {
-        "architecture": "llama",
-        "num_hidden_layers": 28,
-        "num_attention_heads": 24,
-        "hidden_size": 3072,
-        "intermediate_size": 8192,
-        "vocab_size": 128256,
-    },
-}
-
-
-def clamp_progress(value: int) -> int:
-    return max(0, min(100, int(value)))
-
-
-def calc_overall_progress(phase: str, phase_progress: int) -> int:
-    phase_progress = clamp_progress(phase_progress)
-    if phase == "strategy":
-        return phase_progress // 2
-    if phase == "loading":
-        return 50 + phase_progress // 2
-    if phase == "completed":
-        return 100
-    return phase_progress
-
-
-def serialize_task(task: ScheduleTask) -> dict:
-    return {
-        "task_id": task.task_id,
-        "status": task.status,
-        "phase": task.phase,
-        "phase_progress": task.phase_progress,
-        "overall_progress": task.overall_progress,
-        "message": task.message,
-        "edge_progress": task.edge_progress,
-        "cloud_progress": task.cloud_progress,
-        "edge_status": task.edge_status,
-        "cloud_status": task.cloud_status,
-        "edge_message": task.edge_message,
-        "cloud_message": task.cloud_message,
-        "error_detail": task.error_detail,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
-    }
-
-
-def build_strategy_display_layer_partitions(layer_partitions: list[dict]) -> list[dict]:
-    display_layers = []
-    for layer in layer_partitions:
-        head_assignments = list(layer.get("head_assignments", []))
-        edge_head_count = sum(1 for assignment in head_assignments if assignment == 0)
-        cloud_head_count = sum(1 for assignment in head_assignments if assignment == 1)
-        display_layers.append(
-            {
-                "layer_id": layer.get("layer_id"),
-                "head_assignments": head_assignments,
-                "ffn_assignment": layer.get("ffn_assignment"),
-                "edge_head_count": edge_head_count,
-                "cloud_head_count": cloud_head_count,
-            }
-        )
-    return display_layers
-
-
-def build_strategy_display_summary(display_layers: list[dict]) -> dict:
-    return {
-        "edge_head_count_total": sum(layer.get("edge_head_count", 0) for layer in display_layers),
-        "cloud_head_count_total": sum(layer.get("cloud_head_count", 0) for layer in display_layers),
-    }
-
-
-def update_task(
-    db: Session,
-    task: ScheduleTask,
-    *,
-    status: str | None = None,
-    phase: str | None = None,
-    phase_progress: int | None = None,
-    message: str | None = None,
-    edge_progress: int | None = None,
-    cloud_progress: int | None = None,
-    edge_status: str | None = None,
-    cloud_status: str | None = None,
-    edge_message: str | None = None,
-    cloud_message: str | None = None,
-    strategy_payload: str | None = None,
-    error_detail: str | None = None,
-    edge_device_id: str | None = None,
-    cloud_device_id: str | None = None,
-) -> ScheduleTask:
-    if status is not None:
-        task.status = status
-    if phase is not None:
-        task.phase = phase
-    if message is not None:
-        task.message = message
-    if edge_progress is not None:
-        task.edge_progress = clamp_progress(edge_progress)
-    if cloud_progress is not None:
-        task.cloud_progress = clamp_progress(cloud_progress)
-    if edge_status is not None:
-        task.edge_status = edge_status
-    if cloud_status is not None:
-        task.cloud_status = cloud_status
-    if edge_message is not None:
-        task.edge_message = edge_message
-    if cloud_message is not None:
-        task.cloud_message = cloud_message
-    if strategy_payload is not None:
-        task.strategy_payload = strategy_payload
-    if error_detail is not None:
-        task.error_detail = error_detail
-    if edge_device_id is not None:
-        task.edge_device_id = edge_device_id
-    if cloud_device_id is not None:
-        task.cloud_device_id = cloud_device_id
-
-    if phase_progress is not None:
-        task.phase_progress = clamp_progress(phase_progress)
-    elif task.phase == "loading":
-        task.phase_progress = clamp_progress((task.edge_progress + task.cloud_progress) // 2)
-
-    if task.status == "completed":
-        task.phase = "completed"
-        task.phase_progress = 100
-        task.overall_progress = 100
-    else:
-        task.overall_progress = calc_overall_progress(task.phase, task.phase_progress)
-
-    task.updated_at = datetime.utcnow()
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-    return task
-
-
-def fail_task(db: Session, task: ScheduleTask, message: str, error_detail: str | None = None) -> None:
-    update_task(
-        db,
-        task,
-        status="failed",
-        message=message,
-        error_detail=error_detail or message,
-    )
-
-
-def extract_ip(device_value: str) -> str | None:
-    ip_match = re.search(r"(?:\d{1,3}\.){3}\d{1,3}", device_value)
-    return ip_match.group(0) if ip_match else None
 
 
 def decode_query_token_to_openwebui_user_id(token: str) -> str:
@@ -213,29 +64,106 @@ def decode_query_token_to_openwebui_user_id(token: str) -> str:
     return external_user_id.strip()
 
 
-def find_runtime_node(db: Session, device_id: str, model_key: str, node_role: str) -> ModelNode | None:
-    candidates = (
-        db.query(ModelNode)
-        .filter(
-            ModelNode.device_id == device_id,
-            ModelNode.node_role == node_role,
-            ModelNode.service_type == "runtime",
-            ModelNode.status == "online",
+async def promote_next_queued_task_for_device_pair(
+    *,
+    edge_device_id: str,
+    cloud_device_id: str,
+) -> bool:
+    db = SessionLocal()
+    try:
+        active_task = find_active_task_for_device_pair(
+            db,
+            edge_device_id=edge_device_id,
+            cloud_device_id=cloud_device_id,
         )
-        .order_by(ModelNode.last_heartbeat.desc())
-        .all()
+        if active_task:
+            return False
+
+        next_task = (
+            db.query(ScheduleTask)
+            .filter(
+                ScheduleTask.edge_device_id == edge_device_id,
+                ScheduleTask.cloud_device_id == cloud_device_id,
+                ScheduleTask.queue_status == "queued",
+                ScheduleTask.status == "accepted",
+                ScheduleTask.phase == "queued",
+            )
+            .order_by(ScheduleTask.created_at.asc(), ScheduleTask.task_id.asc())
+            .first()
+        )
+        if not next_task:
+            return False
+
+        next_task.queue_status = "running"
+        next_task.queue_position = 0
+        next_task.phase = "strategy"
+        next_task.message = "前序任务已结束，当前任务开始执行"
+        next_task.updated_at = datetime.utcnow()
+        db.add(next_task)
+        db.commit()
+        db.refresh(next_task)
+
+        recalculate_queue_positions_for_device_pair(
+            db,
+            edge_device_id=edge_device_id,
+            cloud_device_id=cloud_device_id,
+        )
+
+        asyncio.create_task(
+            process_schedule_task(
+                next_task.task_id,
+                next_task.openwebui_user_id,
+                next_task.edge_session_id,
+                {"model_type": next_task.model_type},
+            )
+        )
+        logger.info(
+            "已自动推进排队任务: task_id=%s, edge_device_id=%s, cloud_device_id=%s",
+            next_task.task_id,
+            edge_device_id,
+            cloud_device_id,
+        )
+        return True
+    finally:
+        db.close()
+
+
+async def fail_task_and_promote(
+    db: Session,
+    task: ScheduleTask,
+    message: str,
+    error_detail: str | None = None,
+) -> None:
+    edge_device_id = task.edge_device_id
+    cloud_device_id = task.cloud_device_id
+    fail_task(db, task, message, error_detail)
+    if edge_device_id and cloud_device_id:
+        await promote_next_queued_task_for_device_pair(
+            edge_device_id=edge_device_id,
+            cloud_device_id=cloud_device_id,
+        )
+
+
+async def complete_task_and_promote(db: Session, task: ScheduleTask) -> None:
+    edge_device_id = task.edge_device_id
+    cloud_device_id = task.cloud_device_id
+    update_task(
+        db,
+        task,
+        status="completed",
+        message="边云模型均已加载完成，任务结束",
+        edge_status="ready",
+        cloud_status="ready",
+        edge_progress=100,
+        cloud_progress=100,
+        edge_message="边端模型已加载完成",
+        cloud_message="云端模型已加载完成",
     )
-
-    for node in candidates:
-        if (node.model_key or "").lower() == model_key:
-            return node
-
-    for node in candidates:
-        node_model_key = (node.model_key or "").lower()
-        if node_model_key in {"multi", "*", "all"}:
-            return node
-
-    return candidates[0] if len(candidates) == 1 else None
+    if edge_device_id and cloud_device_id:
+        await promote_next_queued_task_for_device_pair(
+            edge_device_id=edge_device_id,
+            cloud_device_id=cloud_device_id,
+        )
 
 
 def derive_edge_storage_limit_gb_from_metrics(edge_metrics: dict) -> float:
@@ -256,14 +184,6 @@ def derive_edge_storage_limit_gb_from_metrics(edge_metrics: dict) -> float:
     return round(gpu_available_mb / 1024.0, 2)
 
 
-async def dispatch_strategy_to_runtime(node: ModelNode, payload: dict) -> None:
-    control_path = node.control_path or "/load_strategy"
-    runtime_url = f"http://{node.ip_address}:{node.port}{control_path}"
-    async with httpx.AsyncClient() as client:
-        response = await client.post(runtime_url, json=payload, timeout=5.0)
-        response.raise_for_status()
-
-
 async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_session_id: str, trigger_payload: dict) -> None:
     db = SessionLocal()
     try:
@@ -275,7 +195,7 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
         model_type = trigger_payload["model_type"]
         model_type_key = model_type.lower()
         if model_type_key not in MODEL_REGISTRY:
-            fail_task(db, task, "不支持的模型类型", f"不支持的模型类型: {model_type}")
+            await fail_task_and_promote(db, task, "不支持的模型类型", f"不支持的模型类型: {model_type}")
             return
 
         update_task(
@@ -285,6 +205,9 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             phase="strategy",
             phase_progress=5,
             message="正在校验用户权限并准备采集环境指标",
+            queue_status="running",
+            queue_position=0,
+            dispatched_at=datetime.utcnow(),
             edge_message="等待切分策略计算完成",
             cloud_message="等待切分策略计算完成",
         )
@@ -299,13 +222,18 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             .first()
         )
         if not edge_session:
-            fail_task(db, task, "初始化会话不存在", f"未找到 session_id={edge_session_id} 对应的有效会话")
+            await fail_task_and_promote(
+                db,
+                task,
+                "初始化会话不存在",
+                f"未找到 session_id={edge_session_id} 对应的有效会话",
+            )
             return
 
         edge_device = db.query(Device).filter(Device.id == edge_session.edge_device_id).first()
         cloud_device = db.query(Device).filter(Device.id == edge_session.cloud_device_id).first()
         if not edge_device or not cloud_device:
-            fail_task(db, task, "会话设备信息缺失", "边端或云端设备在资产表中不存在")
+            await fail_task_and_promote(db, task, "会话设备信息缺失", "边端或云端设备在资产表中不存在")
             return
 
         edge_device_id = edge_device.id
@@ -323,7 +251,12 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
         )
 
         if not cloud_ip or not edge_ip or not cloud_device_id or not edge_device_id:
-            fail_task(db, task, "用户设备分配不完整", "触发失败：该用户分配的设备不完整，无法凑齐端云流水线 (需1云1边)")
+            await fail_task_and_promote(
+                db,
+                task,
+                "用户设备分配不完整",
+                "触发失败：该用户分配的设备不完整，无法凑齐端云流水线 (需1云1边)",
+            )
             return
 
         edge_metrics, cloud_metrics, network_metrics = await asyncio.gather(
@@ -331,13 +264,27 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             get_prometheus_metrics(cloud_ip),
             get_network_metrics(edge_ip, cloud_ip),
         )
+        logical_queue_metrics = build_logical_queue_metrics(
+            db,
+            edge_device_id=edge_device_id,
+            cloud_device_id=cloud_device_id,
+        )
+        edge_metrics = {
+            **edge_metrics,
+            "queue_len": logical_queue_metrics["edge_queue_len"],
+        }
+        cloud_metrics = {
+            **cloud_metrics,
+            "queue_len": logical_queue_metrics["cloud_queue_len"],
+        }
         edge_storage_limit_gb = derive_edge_storage_limit_gb_from_metrics(edge_metrics)
 
         logger.info(
-            "边端可用显存预算采集完成: task_id=%s, edge_ip=%s, storage_limit_gb=%s",
+            "边端可用显存预算采集完成: task_id=%s, edge_ip=%s, storage_limit_gb=%s, logical_queue_metrics=%s",
             task_id,
             edge_ip,
             edge_storage_limit_gb,
+            logical_queue_metrics,
         )
 
         raw_input_json = {
@@ -445,7 +392,7 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
                 missing_parts.append(f"边端节点(device_id={edge_device_id})")
             if not cloud_node:
                 missing_parts.append(f"云端节点(device_id={cloud_device_id})")
-            fail_task(db, task, "未找到在线推理节点", "、".join(missing_parts) + " 未注册或不在线")
+            await fail_task_and_promote(db, task, "未找到在线推理节点", "、".join(missing_parts) + " 未注册或不在线")
             return
 
         update_task(
@@ -495,7 +442,7 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
 
         dispatch_errors = [str(result) for result in results if isinstance(result, Exception)]
         if dispatch_errors:
-            fail_task(db, task, "切分策略下发失败", " | ".join(dispatch_errors))
+            await fail_task_and_promote(db, task, "切分策略下发失败", " | ".join(dispatch_errors))
             return
 
         update_task(
@@ -515,12 +462,12 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             PENDING_STRATEGY_TASKS.pop(task_id, None)
         task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
         if task:
-            fail_task(db, task, "等待算法组计算切分策略超时", "等待算法组计算切分策略超时 (30s)")
+            await fail_task_and_promote(db, task, "等待算法组计算切分策略超时", "等待算法组计算切分策略超时 (30s)")
     except Exception as exc:
         logger.exception("调度任务执行异常: task_id=%s", task_id)
         task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
         if task:
-            fail_task(db, task, "调度任务执行失败", str(exc))
+            await fail_task_and_promote(db, task, "调度任务执行失败", str(exc))
     finally:
         PENDING_STRATEGY_TASKS.pop(task_id, None)
         db.close()
@@ -543,18 +490,36 @@ async def collect_raw_json(
     db.refresh(edge_session)
 
     task_id = str(uuid.uuid4())
+    edge_device_id = edge_session.edge_device_id
+    cloud_device_id = edge_session.cloud_device_id
+    active_task = find_active_task_for_device_pair(
+        db,
+        edge_device_id=edge_device_id,
+        cloud_device_id=cloud_device_id,
+    )
+    queued_count = count_queued_tasks_for_device_pair(
+        db,
+        edge_device_id=edge_device_id,
+        cloud_device_id=cloud_device_id,
+    )
+    is_queued = active_task is not None
+
     task = ScheduleTask(
         task_id=task_id,
         openwebui_user_id=current_openwebui_user_id,
         edge_session_id=edge_session.session_id,
         model_type=request.model_type,
         status="accepted",
-        phase="strategy",
+        phase="queued" if is_queued else "strategy",
         phase_progress=0,
         overall_progress=0,
-        message="任务已受理，开始计算切分策略",
+        message="当前边云推理节点繁忙，任务已进入排队" if is_queued else "任务已受理，开始计算切分策略",
+        edge_device_id=edge_device_id,
+        cloud_device_id=cloud_device_id,
         edge_status="pending",
         cloud_status="pending",
+        queue_status="queued" if is_queued else "running",
+        queue_position=queued_count + 1 if is_queued else 0,
         edge_message="等待切分策略计算完成",
         cloud_message="等待切分策略计算完成",
         created_at=datetime.utcnow(),
@@ -563,22 +528,23 @@ async def collect_raw_json(
     db.add(task)
     db.commit()
 
-    asyncio.create_task(
-        process_schedule_task(
-            task_id,
-            current_openwebui_user_id,
-            edge_session.session_id,
-            request.model_dump(),
+    if not is_queued:
+        asyncio.create_task(
+            process_schedule_task(
+                task_id,
+                current_openwebui_user_id,
+                edge_session.session_id,
+                request.model_dump(),
+            )
         )
-    )
 
     return {
         "status": "accepted",
         "task_id": task_id,
-        "phase": "strategy",
+        "phase": "queued" if is_queued else "strategy",
         "phase_progress": 0,
         "overall_progress": 0,
-        "message": "任务已受理，开始计算切分策略",
+        "message": "当前边云推理节点繁忙，任务已进入排队" if is_queued else "任务已受理，开始计算切分策略",
     }
 
 
@@ -687,6 +653,8 @@ async def handle_runtime_progress(payload: RuntimeProgressCallbackRequest, callb
         task = db.query(ScheduleTask).filter(ScheduleTask.task_id == payload.task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="未找到对应的调度任务")
+        if task.status in TASK_TERMINAL_STATUSES:
+            return {"status": "success", "message": "任务已处于终态，忽略重复回调"}
 
         resolved_node_role = callback_role or payload.node_role
         if not resolved_node_role:
@@ -700,7 +668,7 @@ async def handle_runtime_progress(payload: RuntimeProgressCallbackRequest, callb
             raise HTTPException(status_code=400, detail="node_role 仅支持 edge 或 cloud")
 
         if node_status == "failed":
-            fail_task(db, task, payload.message, f"{node_role} runtime failed")
+            await fail_task_and_promote(db, task, payload.message, f"{node_role} runtime failed")
             return {"status": "success", "message": "失败状态已记录"}
 
         update_kwargs = {
@@ -725,27 +693,11 @@ async def handle_runtime_progress(payload: RuntimeProgressCallbackRequest, callb
             and task.edge_status in {"ready", "completed"}
             and task.cloud_status in {"ready", "completed"}
         ):
-            update_task(
-                db,
-                task,
-                status="completed",
-                message="边云模型均已加载完成，任务结束",
-                edge_status="ready",
-                cloud_status="ready",
-                edge_progress=100,
-                cloud_progress=100,
-                edge_message="边端模型已加载完成",
-                cloud_message="云端模型已加载完成",
-            )
+            await complete_task_and_promote(db, task)
 
         return {"status": "success", "message": "加载进度已记录"}
     finally:
         db.close()
-
-
-@router.post("/runtime_callback", summary="【推理节点专用】接收边云模型加载进度回调（兼容旧版）")
-async def receive_runtime_progress(payload: RuntimeProgressCallbackRequest):
-    return await handle_runtime_progress(payload)
 
 
 @router.post("/runtime_callback/edge", summary="【推理节点专用】接收边端模型加载进度回调")

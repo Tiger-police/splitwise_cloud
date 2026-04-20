@@ -1,89 +1,4 @@
 const API_BASE_URL = "/api/v1";
-let sandboxSseConnection = null; // 用于沙盘模型状态的实时流
-window.boundDeviceMap = { edge: null, cloud: null };
-
-// 开启沙盘模型实时流
-function startSandboxModelStream() {
-    if (!localStorage.getItem('jwt_token')) return;
-
-    if (sandboxSseConnection) sandboxSseConnection.close();
-
-    // 连接后端的 SSE 流接口
-    sandboxSseConnection = new EventSource(`${API_BASE_URL}/models/stream`);
-
-    sandboxSseConnection.onmessage = function(event) {
-        const data = JSON.parse(event.data);
-        renderSandboxModels(data.nodes || []);
-    };
-
-    sandboxSseConnection.onerror = function() {
-        document.getElementById('active-models-container').innerHTML =
-            '<span style="color: #ff7b72; font-size: 0.9rem;">⚠️ 状态同步断开，尝试重连中...</span>';
-    };
-}
-
-// 提取并去重渲染模型徽章
-function renderSandboxModels(nodes) {
-    const container = document.getElementById('active-models-container');
-    const availableModels = new Set();
-    const boundEdgeDeviceId = window.boundDeviceMap.edge;
-    const boundCloudDeviceId = window.boundDeviceMap.cloud;
-
-    if (!boundEdgeDeviceId || !boundCloudDeviceId) {
-        container.innerHTML = '<span style="color: #ff7b72; font-size: 0.9rem;">⚠️ 当前账号绑定设备信息不完整，无法判断可用协同模型</span>';
-        return;
-    }
-
-    const groupedModels = new Map();
-
-    nodes.forEach(node => {
-        if (node.status !== 'online' || node.service_type !== 'runtime') {
-            return;
-        }
-
-        if (node.device_id !== boundEdgeDeviceId && node.device_id !== boundCloudDeviceId) {
-            return;
-        }
-
-        const candidateModels = Array.isArray(node.supported_models) && node.supported_models.length > 0
-            ? node.supported_models
-            : [node.model_key || node.model_name];
-
-        candidateModels.forEach(modelName => {
-            if (!groupedModels.has(modelName)) {
-                groupedModels.set(modelName, { edge: false, cloud: false });
-            }
-
-            const modelState = groupedModels.get(modelName);
-            if (node.device_id === boundEdgeDeviceId && node.node_role === 'edge') {
-                modelState.edge = true;
-            }
-            if (node.device_id === boundCloudDeviceId && node.node_role === 'cloud') {
-                modelState.cloud = true;
-            }
-        });
-    });
-
-    groupedModels.forEach((modelState, modelName) => {
-        if (modelState.edge && modelState.cloud) {
-            availableModels.add(modelName);
-        }
-    });
-
-    if (availableModels.size === 0) {
-        container.innerHTML = '<span style="color: #8b949e; font-size: 0.9rem;">🚫 你的边端与云端当前没有同时在线的协同模型</span>';
-        return;
-    }
-
-    // 渲染极简的模型标签 (Badge)
-    container.innerHTML = '';
-    availableModels.forEach(modelName => {
-        const badge = document.createElement('div');
-        badge.style.cssText = 'background: rgba(56, 189, 248, 0.1); color: var(--edge-color); border: 1px solid var(--edge-color); padding: 4px 12px; border-radius: 12px; font-size: 0.85rem; font-weight: bold; box-shadow: 0 0 8px rgba(56, 189, 248, 0.2);';
-        badge.textContent = `🚀 ${modelName}`;
-        container.appendChild(badge);
-    });
-}
 
 // ==========================================
 // 1. 核心 HTTP 拦截器 (自动带 Token)
@@ -141,16 +56,10 @@ async function handleLogin() {
 
 function logout() {
     localStorage.clear();
-    window.boundDeviceMap = { edge: null, cloud: null };
     window.ipToDeviceMap = {};
     document.getElementById("login-overlay").style.display = "flex";
     document.getElementById("grafana-frame").src = "";
     document.getElementById("admin-panel-btn").style.display = "none";
-    document.getElementById('active-models-container').innerHTML =
-        '<span style="color: #8b949e; font-size: 0.9rem;">等待状态同步...</span>';
-    // if(sseConnection) sseConnection.close(); // 退出时断开 SSE 实时流
-    // 👇 新增：断开沙盘实时流
-    if (sandboxSseConnection) sandboxSseConnection.close();
 }
 
 // ==========================================
@@ -213,7 +122,7 @@ async function createNewDevice() {
 }
 
 async function deleteDevice(id) {
-    if (!confirm(`警告：确定删除物理设备【${id}】吗？这会同步移除所有用户身上的该权限！`)) return;
+    if (!confirm(`警告：确定删除物理设备【${id}】吗？这会同步更新管理员设备列表与监控视图。`)) return;
     try { await fetchWithAuth(`${API_BASE_URL}/system/devices/${id}`, { method: 'DELETE' }); refreshAllAdminData(); } catch (e) { alert("删除失败: " + e.message); }
 }
 
@@ -224,14 +133,11 @@ async function fetchUsers() {
         const users = await res.json();
         tbody.innerHTML = '';
         users.forEach(u => {
-            const devicesHtml = (u.devices || "").split(',').filter(d => d).map(d => {
-                const name = systemDevicesMap[d] || d;
-                return `<span class="tag ${d !== 'cloud' ? 'edge' : ''}">${name.split('(')[0]}</span>`;
-            }).join('');
+            const scopeHtml = '<span class="tag edge">全量设备</span>';
             tbody.innerHTML += `<tr>
                 <td style="font-weight:bold; color:var(--text-bright);">${u.username}</td>
                 <td>${u.role === 'admin' ? '🛡️ Admin' : '👤 User'}</td>
-                <td>${devicesHtml || '<span style="color:#666">无权限</span>'}</td>
+                <td>${scopeHtml}</td>
                 <td>${u.username !== 'admin' ? `<span class="delete-btn" onclick="deleteUser('${u.username}')">删除</span>` : '<span style="color:#666">不可操作</span>'}</td>
             </tr>`;
         });
@@ -281,19 +187,11 @@ async function loadSystemDevices() {
         const devices = await response.json();
         selector.innerHTML = '';
         window.ipToDeviceMap = {};
-        window.boundDeviceMap = { edge: null, cloud: null };
         devices.forEach(device => {
             const option = document.createElement("option");
             option.value = device.value;
             option.textContent = device.name;
             selector.appendChild(option);
-
-            if (device.type === 'edge') {
-                window.boundDeviceMap.edge = device.id;
-            }
-            if (device.type === 'cloud') {
-                window.boundDeviceMap.cloud = device.id;
-            }
 
             // 1. 核心逻辑：自动从 value 中提取真实 IP (现在会自动提取出 10.144.144.2)
             const ipMatch = device.value.match(/(?:\d{1,3}\.){3}\d{1,3}/);
@@ -346,8 +244,6 @@ function initializeDashboard() {
     }
 
     loadSystemDevices();
-    // 👇 新增：启动模型状态流
-    startSandboxModelStream();
 }
 
 // ==========================================

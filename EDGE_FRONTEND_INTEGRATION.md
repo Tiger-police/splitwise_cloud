@@ -12,7 +12,7 @@
 
 2. 新增 `POST /api/v1/session/init`
    - 旧流程：exchange 完 token 后直接发起调度
-   - 新流程：先初始化一次会话，拿到 `session_id`
+   - 新流程：先初始化一次会话，传 `edge_device_ip`，拿到 `session_id`
 
 3. 发起调度时需要额外带 `Session-Id`
    - 旧流程：`Authorization: Bearer <cloud_backend_token>`
@@ -21,20 +21,22 @@
 4. 前端不再负责设备相关信息
    - 旧流程里虽然前端也没有直接传很多设备参数，但后端还存在旧的本地普通用户绑定思路
    - 新流程中已经明确：
-     - 边端设备由后端根据请求来源 IP 自动识别
+     - 边端设备由前端显式传入 `edge_device_ip`
+     - 后端根据 `edge_device_ip` 匹配已登记的边端设备
      - 云端设备当前固定为 `10.144.144.2`
 
 如果边端前端同学之前是按旧版文档开发的，那么现在只需要记住一句话：
 
-**先用 OpenWebUI token 调 `/api/v1/session/init` 拿 `session_id`，后续再用 `openwebui_token + Session-Id` 调度即可。**
+**先用 OpenWebUI token + `edge_device_ip` 调 `/api/v1/session/init` 拿 `session_id`，后续再用 `openwebui_token + Session-Id` 调度即可。**
 
-当前前端只需要完成 5 件事：
+当前前端只需要完成 6 件事：
 
 1. 从 OpenWebUI 读取当前 token
-2. 调用云端后端 `POST /api/v1/session/init`
-3. 保存返回的 `session_id`
-4. 用 OpenWebUI token + `Session-Id` 发起调度任务
-5. 查询任务状态，并在需要时拉取切分策略
+2. 确定当前使用的边端设备 IP
+3. 调用云端后端 `POST /api/v1/session/init`
+4. 保存返回的 `session_id`
+5. 用 OpenWebUI token + `Session-Id` 发起调度任务
+6. 查询任务状态，并在需要时拉取切分策略
 
 前端当前不需要负责：
 
@@ -46,7 +48,7 @@
 
 这些都由云端调度后端负责。当前版本中：
 
-- 边端设备：由云端后端根据请求来源 IP 自动识别
+- 边端设备：由前端传 `edge_device_ip`，云端后端按设备表进行匹配
 - 云端设备：固定为 `cloud`，对应 IP `10.144.144.2`
 
 ## 1. 基本地址
@@ -69,13 +71,14 @@ http://10.144.144.2:8010
 
 1. 用户在 OpenWebUI 登录
 2. 前端读取 OpenWebUI token
-3. 调用 `POST /api/v1/session/init`
-4. 保存返回的 `session_id`
-5. 用户选择模型后，调用 `POST /api/v1/schedule/trigger`
-6. 拿到 `task_id`
-7. 轮询或订阅 `GET /api/v1/schedule/tasks/{task_id}` / `stream`
-8. 当 `phase = "loading"` 时，如需展示切分策略，调用 `GET /api/v1/schedule/tasks/{task_id}/strategy`
-9. 根据 `phase`、`status`、`edge_progress`、`cloud_progress`、`edge_message`、`cloud_message` 更新 UI
+3. 获取当前边端设备 IP
+4. 调用 `POST /api/v1/session/init`
+5. 保存返回的 `session_id`
+6. 用户选择模型后，调用 `POST /api/v1/schedule/trigger`
+7. 拿到 `task_id`
+8. 轮询或订阅 `GET /api/v1/schedule/tasks/{task_id}` / `stream`
+9. 当 `phase = "loading"` 时，如需展示切分策略，调用 `GET /api/v1/schedule/tasks/{task_id}/strategy`
+10. 根据 `phase`、`status`、`edge_progress`、`cloud_progress`、`edge_message`、`cloud_message` 更新 UI
 
 ## 3. 时序图
 
@@ -125,7 +128,11 @@ Authorization: Bearer <openwebui_token>
 
 ### 请求体
 
-无请求体。
+```json
+{
+  "edge_device_ip": "10.144.144.3"
+}
+```
 
 ### 成功响应示例
 
@@ -154,9 +161,9 @@ Authorization: Bearer <openwebui_token>
 ### 说明
 
 - 这一步会完成 OpenWebUI token 验签
-- 这一步会根据请求来源 IP 自动识别边端设备
+- 这一步会根据前端传入的 `edge_device_ip` 匹配已登记的边端设备
 - 这一步会返回本次后续请求要使用的 `session_id`
-- 当前阶段前端不需要自己传边端设备 ID
+- 前端当前需要传真实边端模型推理服务所在设备的 IP
 
 ## 5. 发起调度任务接口
 
@@ -441,8 +448,12 @@ async function initSession(openwebuiToken) {
   const res = await fetch("http://10.144.144.2:8010/api/v1/session/init", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${openwebuiToken}`
-    }
+      "Authorization": `Bearer ${openwebuiToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      edge_device_ip: "10.144.144.3"
+    })
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.detail || "session 初始化失败");
@@ -510,9 +521,10 @@ async function getTaskStrategy(taskId) {
 边端前端现在只要完成下面这些，就能完成对接：
 
 1. 读取 OpenWebUI token
-2. 调 `POST /api/v1/session/init`
-3. 保存 `session_id`
-4. 调 `POST /api/v1/schedule/trigger`
-5. 查询 `GET /api/v1/schedule/tasks/{task_id}`
-6. 如需展示策略，在 `phase = "loading"` 后调 `GET /api/v1/schedule/tasks/{task_id}/strategy`
-7. 根据 `phase`、`status`、`message`、`edge_message`、`cloud_message`、`edge_progress`、`cloud_progress` 更新 UI
+2. 获取真实边端设备 IP
+3. 调 `POST /api/v1/session/init`
+4. 保存 `session_id`
+5. 调 `POST /api/v1/schedule/trigger`
+6. 查询 `GET /api/v1/schedule/tasks/{task_id}`
+7. 如需展示策略，在 `phase = "loading"` 后调 `GET /api/v1/schedule/tasks/{task_id}/strategy`
+8. 根据 `phase`、`status`、`message`、`edge_message`、`cloud_message`、`edge_progress`、`cloud_progress` 更新 UI

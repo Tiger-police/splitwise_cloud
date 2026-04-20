@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends
-from app.models.models import User, Device
+from app.models.models import User
 from app.schemas.schemas import UserCreate
 from app.api.deps import get_current_admin, get_db
 from app.core.security import get_password_hash
@@ -7,9 +7,9 @@ from app.core.security import get_password_hash
 router = APIRouter()
 
 
-@router.get("/my_devices", summary="旧普通用户设备接口（已移除）")
-async def removed_my_devices_route():
-    # 显式占位，避免被 /{username} 的动态路由误命中后返回 405。
+@router.get("/my_devices", include_in_schema=False)
+async def reserved_my_devices_path():
+    # 保留 404 占位，避免被 /{username} 的动态路由误命中后返回 405。
     raise HTTPException(status_code=404, detail="Not Found")
 
 @router.get("", summary="【Admin】获取所有账号列表")
@@ -19,7 +19,7 @@ async def list_users(admin_user: User = Depends(get_current_admin), db = Depends
         {
             "username": u.username,
             "role": u.role,
-            "devices": u.allowed_devices,
+            "device_scope": "all",
         }
         for u in users
     ]
@@ -30,15 +30,10 @@ async def create_user(user_in: UserCreate, admin_user: User = Depends(get_curren
     if db.query(User).filter(User.username == user_in.username).first():
         raise HTTPException(status_code=400, detail="账号名已存在")
 
-    all_devices = db.query(Device).all()
-    final_devices = ",".join([d.id for d in all_devices])
-
     new_user = User(
         username=user_in.username,
-        openwebui_user_id=None,
         hashed_password=get_password_hash(user_in.password),
         role="admin",
-        allowed_devices=final_devices
     )
     db.add(new_user)
     db.commit()

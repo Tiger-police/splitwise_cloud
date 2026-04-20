@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.db.database import Base, engine
-from app.models.models import init_db_data, run_lightweight_migrations
+from app.models.models import init_db_data
 from app.services.watchdog import health_check_watchdog
 
 logger = logging.getLogger("AppLifespan")
@@ -14,7 +14,6 @@ logger = logging.getLogger("AppLifespan")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
-    run_lightweight_migrations()
     init_db_data()
 
     app.state.watchdog_task = asyncio.create_task(health_check_watchdog())

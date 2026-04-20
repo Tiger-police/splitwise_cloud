@@ -1,18 +1,5 @@
-from typing import List, Optional, Literal
+from typing import List, Optional
 from pydantic import BaseModel
-
-class EdgeStateRequest(BaseModel):
-    edge_id: str
-    available_vram: float
-    ping_latency: float
-    model_name: str
-
-class StrategyResponse(BaseModel):
-    task_id: str
-    edge_layers: int
-    cloud_layers: int
-    status: str
-    message: str
 
 class ModelRegisterRequest(BaseModel):
     """节点上线注册请求体"""
@@ -46,10 +33,13 @@ class SessionInitResponse(BaseModel):
     cloud_device: Optional[dict] = None
     message: str
 
+
+class SessionInitRequest(BaseModel):
+    edge_device_ip: str
+
 class UserCreate(BaseModel):
     username: str
     password: str
-    role: Literal["admin"] = "admin"
 
 class DeviceCreate(BaseModel):
     id: str

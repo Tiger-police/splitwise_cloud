@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from fastapi import Depends, Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jwt import PyJWTError
 
@@ -56,12 +56,6 @@ async def get_current_openwebui_user_id(
     return external_user_id.strip()
 
 
-def get_request_ip(request: Request) -> str:
-    if not request.client or not request.client.host:
-        raise HTTPException(status_code=400, detail="无法识别请求来源 IP")
-    return request.client.host
-
-
 def extract_ips(device_value: str | None) -> list[str]:
     if not device_value:
         return []
@@ -77,23 +71,20 @@ def extract_ips(device_value: str | None) -> list[str]:
     return results
 
 
-def resolve_edge_device_by_request_ip(request: Request, db) -> Device:
-    request_ip = get_request_ip(request)
+def resolve_edge_device_by_ip(edge_device_ip: str, db) -> Device:
+    candidate_ip = edge_device_ip.strip()
+    if not candidate_ip:
+        raise HTTPException(status_code=400, detail="edge_device_ip 不能为空")
+
     devices = db.query(Device).filter(Device.device_type == "edge").all()
     for device in devices:
-        if request_ip in extract_ips(device.value):
+        if candidate_ip in extract_ips(device.value):
             return device
 
-    if settings.LOCAL_RUNTIME_FALLBACK_ENABLED and request_ip in {"127.0.0.1", "::1"}:
-        fallback_device = db.query(Device).filter(Device.id == "edge_A").first()
-        if fallback_device:
-            return fallback_device
-
-    raise HTTPException(status_code=403, detail=f"请求来源 IP {request_ip} 未匹配到已登记的边端设备")
+    raise HTTPException(status_code=403, detail=f"edge_device_ip={candidate_ip} 未匹配到已登记的边端设备")
 
 
 async def get_current_edge_session(
-    request: Request,
     db = Depends(get_db),
     openwebui_user_id: str = Depends(get_current_openwebui_user_id),
     session_id: str = Header(..., alias="Session-Id"),
@@ -111,10 +102,6 @@ async def get_current_edge_session(
 
     if edge_session.openwebui_user_id != openwebui_user_id:
         raise HTTPException(status_code=403, detail="会话所属用户与当前 OpenWebUI token 不一致")
-
-    request_ip = get_request_ip(request)
-    if edge_session.edge_ip != request_ip:
-        raise HTTPException(status_code=403, detail="当前请求来源 IP 与初始化会话不一致")
 
     if edge_session.expires_at <= datetime.utcnow():
         edge_session.status = "expired"
