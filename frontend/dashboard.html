@@ -38,13 +38,6 @@
             <iframe id="grafana-frame" src="" title="Grafana Monitor" style="border-radius: 8px; flex: 1;"></iframe>
         </div>
         <div id="view-sandbox" class="view-section">
-            <div style="background: var(--panel-bg); border: 1px solid var(--border-color); border-radius: 8px; padding: 15px 20px; margin-bottom: 20px; flex-shrink: 0;">
-                <h3 style="margin-top: 0; margin-bottom: 12px; font-size: 1.05rem; border-left: 3px solid var(--edge-color); padding-left: 10px;">🧠 我的可用大模型 (部署状态)</h3>
-                <div id="active-models-container" style="display: flex; gap: 10px; flex-wrap: wrap;">
-                    <span style="color: #8b949e; font-size: 0.9rem;">等待状态同步...</span>
-                </div>
-            </div>
-
             <div style="flex: 1; border: 2px dashed #30363d; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #8b949e; background: rgba(0,0,0,0.2);">
                 <h2>沙盘核心交互区域 (待开发)</h2>
             </div>
@@ -77,7 +70,7 @@
                 <div class="admin-section">
                     <div class="user-table-container">
                         <table>
-                            <thead><tr><th>账号名</th><th>角色</th><th>拥有监控设备</th><th>操作</th></tr></thead>
+                            <thead><tr><th>账号名</th><th>角色</th><th>监控范围</th><th>操作</th></tr></thead>
                             <tbody id="user-table-body"></tbody>
                         </table>
                     </div>

@@ -1,7 +1,9 @@
 import logging
-from sqlalchemy import Column, Integer, String, DateTime, Text, inspect, text
 from datetime import datetime
-from app.db.database import Base, SessionLocal, engine
+from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.database import Base, SessionLocal
 from app.core.config import settings
 from app.core.security import get_password_hash
 
@@ -10,20 +12,18 @@ logger = logging.getLogger("InitDB")
 
 class Device(Base):
     __tablename__ = "devices"
-    id = Column(String, primary_key=True, index=True)
-    name = Column(String)
-    value = Column(String)
-    device_type = Column(String, default="edge")  # 👇 新增：记录设备类型
+    id: Mapped[str] = mapped_column(String, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String)
+    value: Mapped[str] = mapped_column(String)
+    device_type: Mapped[str] = mapped_column(String, default="edge")  # 👇 新增：记录设备类型
 
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    openwebui_user_id = Column(String, unique=True, index=True, nullable=True)
-    hashed_password = Column(String)
-    role = Column(String)
-    allowed_devices = Column(String)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    username: Mapped[str] = mapped_column(String, unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String)
+    role: Mapped[str] = mapped_column(String)
 
 
 class ModelNode(Base):
@@ -32,128 +32,62 @@ class ModelNode(Base):
     """
     __tablename__ = "model_nodes"
 
-    id = Column(Integer, primary_key=True, index=True)
-    model_key = Column(String, index=True)  # 例如: "gpt2" / "llama-3.2-3b"
-    model_name = Column(String)  # 例如: "meta-llama/Llama-3.2-3B"
-    device_id = Column(String, index=True)  # 对应 Device.id，例如 cloud / edge_A
-    node_role = Column(String, default="edge")  # edge / cloud
-    service_type = Column(String, default="runtime")  # runtime / monitor 等
-    ip_address = Column(String, index=True)  # 节点IP
-    port = Column(Integer, index=True)  # 节点端口 (如 8001, 8002)
-    control_path = Column(String, default="/load_strategy")  # 下发策略的控制接口路径
-    supported_models = Column(Text, nullable=True)  # 多模型 runtime 支持的模型列表(JSON)
-    status = Column(String, default="online")  # "online" 或 "offline"
-    last_heartbeat = Column(DateTime, default=datetime.utcnow)  # 最后活跃时间
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    model_key: Mapped[str | None] = mapped_column(String, index=True)  # 例如: "gpt2" / "llama-3.2-3b"
+    device_id: Mapped[str | None] = mapped_column(String, index=True)  # 对应 Device.id，例如 cloud / edge_A
+    node_role: Mapped[str] = mapped_column(String, default="edge")  # edge / cloud
+    service_type: Mapped[str] = mapped_column(String, default="runtime")  # runtime / monitor 等
+    ip_address: Mapped[str | None] = mapped_column(String, index=True)  # 节点IP
+    port: Mapped[int | None] = mapped_column(Integer, index=True)  # 节点端口 (如 8001, 8002)
+    control_path: Mapped[str] = mapped_column(String, default="/load_strategy")  # 下发策略的控制接口路径
+    supported_models: Mapped[str | None] = mapped_column(Text, nullable=True)  # 多模型 runtime 支持的模型列表(JSON)
+    status: Mapped[str] = mapped_column(String, default="online")  # "online" 或 "offline"
+    last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)  # 最后活跃时间
 
 
 class ScheduleTask(Base):
     __tablename__ = "schedule_tasks"
 
-    task_id = Column(String, primary_key=True, index=True)
-    username = Column(String, index=True)
-    openwebui_user_id = Column(String, index=True, nullable=True)
-    edge_session_id = Column(String, index=True, nullable=True)
-    model_type = Column(String, index=True)
-    status = Column(String, default="accepted")
-    phase = Column(String, default="strategy")
-    phase_progress = Column(Integer, default=0)
-    overall_progress = Column(Integer, default=0)
-    message = Column(String, default="任务已受理")
-    edge_device_id = Column(String, nullable=True)
-    cloud_device_id = Column(String, nullable=True)
-    edge_progress = Column(Integer, default=0)
-    cloud_progress = Column(Integer, default=0)
-    edge_status = Column(String, default="pending")
-    cloud_status = Column(String, default="pending")
-    edge_message = Column(String, default="等待边端模型加载")
-    cloud_message = Column(String, default="等待云端模型加载")
-    strategy_payload = Column(Text, nullable=True)
-    error_detail = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    task_id: Mapped[str] = mapped_column(String, primary_key=True, index=True)
+    openwebui_user_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    edge_session_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    model_type: Mapped[str] = mapped_column(String, index=True)
+    status: Mapped[str] = mapped_column(String, default="accepted")
+    phase: Mapped[str] = mapped_column(String, default="strategy")
+    phase_progress: Mapped[int] = mapped_column(Integer, default=0)
+    overall_progress: Mapped[int] = mapped_column(Integer, default=0)
+    message: Mapped[str] = mapped_column(String, default="任务已受理")
+    edge_device_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    cloud_device_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    edge_progress: Mapped[int] = mapped_column(Integer, default=0)
+    cloud_progress: Mapped[int] = mapped_column(Integer, default=0)
+    edge_status: Mapped[str] = mapped_column(String, default="pending")
+    cloud_status: Mapped[str] = mapped_column(String, default="pending")
+    queue_status: Mapped[str] = mapped_column(String, default="pending")
+    queue_position: Mapped[int] = mapped_column(Integer, default=0)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    edge_message: Mapped[str] = mapped_column(String, default="等待边端模型加载")
+    cloud_message: Mapped[str] = mapped_column(String, default="等待云端模型加载")
+    strategy_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class EdgeSession(Base):
     __tablename__ = "edge_sessions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    session_id = Column(String, unique=True, index=True)
-    openwebui_user_id = Column(String, index=True)
-    edge_device_id = Column(String, index=True)
-    edge_ip = Column(String, index=True)
-    cloud_device_id = Column(String, index=True)
-    model_type = Column(String, nullable=True)
-    status = Column(String, default="active")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    expires_at = Column(DateTime, nullable=False)
-
-
-def run_lightweight_migrations():
-    """
-    SQLite 轻量补丁：为已存在的表补齐新列。
-    create_all 不会为已有表自动加列，这里手动兜底。
-    """
-    with engine.begin() as conn:
-        inspector = inspect(conn)
-        table_names = set(inspector.get_table_names())
-
-        if "model_nodes" in table_names:
-            existing_columns = {col["name"] for col in inspector.get_columns("model_nodes")}
-            column_patches = [
-                ("model_key", "ALTER TABLE model_nodes ADD COLUMN model_key VARCHAR"),
-                ("device_id", "ALTER TABLE model_nodes ADD COLUMN device_id VARCHAR"),
-                ("node_role", "ALTER TABLE model_nodes ADD COLUMN node_role VARCHAR DEFAULT 'edge'"),
-                ("service_type", "ALTER TABLE model_nodes ADD COLUMN service_type VARCHAR DEFAULT 'runtime'"),
-                ("control_path", "ALTER TABLE model_nodes ADD COLUMN control_path VARCHAR DEFAULT '/load_strategy'"),
-                ("supported_models", "ALTER TABLE model_nodes ADD COLUMN supported_models TEXT"),
-            ]
-
-            for column_name, statement in column_patches:
-                if column_name not in existing_columns:
-                    logger.info("🧩 正在为 model_nodes 补充新字段: %s", column_name)
-                    conn.execute(text(statement))
-
-            conn.execute(text("UPDATE model_nodes SET model_key = lower(model_name) WHERE model_key IS NULL"))
-            conn.execute(text("UPDATE model_nodes SET node_role = 'edge' WHERE node_role IS NULL"))
-            conn.execute(text("UPDATE model_nodes SET service_type = 'runtime' WHERE service_type IS NULL"))
-            conn.execute(text("UPDATE model_nodes SET control_path = '/load_strategy' WHERE control_path IS NULL"))
-
-        if "users" in table_names:
-            existing_columns = {col["name"] for col in inspector.get_columns("users")}
-            if "openwebui_user_id" not in existing_columns:
-                logger.info("🧩 正在为 users 补充新字段: openwebui_user_id")
-                conn.execute(text("ALTER TABLE users ADD COLUMN openwebui_user_id VARCHAR"))
-            conn.execute(text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_openwebui_user_id "
-                "ON users (openwebui_user_id)"
-            ))
-
-        if "schedule_tasks" in table_names:
-            existing_columns = {col["name"] for col in inspector.get_columns("schedule_tasks")}
-            schedule_task_patches = [
-                ("openwebui_user_id", "ALTER TABLE schedule_tasks ADD COLUMN openwebui_user_id VARCHAR"),
-                ("edge_session_id", "ALTER TABLE schedule_tasks ADD COLUMN edge_session_id VARCHAR"),
-                ("edge_message", "ALTER TABLE schedule_tasks ADD COLUMN edge_message VARCHAR DEFAULT '等待边端模型加载'"),
-                ("cloud_message", "ALTER TABLE schedule_tasks ADD COLUMN cloud_message VARCHAR DEFAULT '等待云端模型加载'"),
-            ]
-            for column_name, statement in schedule_task_patches:
-                if column_name not in existing_columns:
-                    logger.info("🧩 正在为 schedule_tasks 补充新字段: %s", column_name)
-                    conn.execute(text(statement))
-
-            conn.execute(
-                text(
-                    "UPDATE schedule_tasks SET edge_message = '等待边端模型加载' "
-                    "WHERE edge_message IS NULL OR edge_message = ''"
-                )
-            )
-            conn.execute(
-                text(
-                    "UPDATE schedule_tasks SET cloud_message = '等待云端模型加载' "
-                    "WHERE cloud_message IS NULL OR cloud_message = ''"
-                )
-            )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    session_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    openwebui_user_id: Mapped[str] = mapped_column(String, index=True)
+    edge_device_id: Mapped[str] = mapped_column(String, index=True)
+    edge_ip: Mapped[str] = mapped_column(String, index=True)
+    cloud_device_id: Mapped[str] = mapped_column(String, index=True)
+    model_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="active")
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 def init_db_data():
@@ -181,20 +115,10 @@ def init_db_data():
         logger.info("🛠️ 首次启动：正在向数据库注入初始管理员账号...")
         admin = User(
             username=admin_username,
-            openwebui_user_id="ow-admin",
             hashed_password=get_password_hash(admin_password),
             role="admin",
-            allowed_devices="cloud,edge_A,edge_B"
         )
         db.add(admin)
-        db.commit()
-
-    admin_user = db.query(User).filter(User.role == "admin").order_by(User.id.asc()).first()
-    changed = False
-    if admin_user and not admin_user.openwebui_user_id:
-        admin_user.openwebui_user_id = "ow-admin"
-        changed = True
-    if changed:
         db.commit()
 
     db.close()

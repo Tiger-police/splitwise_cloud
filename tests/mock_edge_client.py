@@ -17,13 +17,14 @@ STRATEGY_URL_TEMPLATE = "http://127.0.0.1:8010/api/v1/schedule/tasks/{task_id}/s
 OPENWEBUI_JWT_SECRET = os.getenv("OPENWEBUI_JWT_SECRET", "")
 OPENWEBUI_JWT_ALGORITHM = os.getenv("OPENWEBUI_JWT_ALGORITHM", "HS256")
 OPENWEBUI_SKIP_SIGNATURE_VERIFY = os.getenv("OPENWEBUI_SKIP_SIGNATURE_VERIFY", "").strip().lower() in {"1", "true", "yes", "on"}
+EDGE_DEVICE_IP = os.getenv("EDGE_DEVICE_IP", "10.144.144.3")
 # 默认使用一个独立的模拟 OpenWebUI 用户 ID。
 # 如果需要联调真实 OpenWebUI 用户，可通过环境变量 OPENWEBUI_MOCK_USER_ID 覆盖。
 OPENWEBUI_MOCK_USER_ID = os.getenv("OPENWEBUI_MOCK_USER_ID", "mock-openwebui-user")
 OPENWEBUI_MOCK_EXPIRE_SECONDS = int(os.getenv("OPENWEBUI_MOCK_EXPIRE_SECONDS", "3600"))
 
 payload = {
-    "model_type": "gpt2"
+    "model_type": "llama-3.2-3b"
 }
 
 def build_mock_openwebui_token(openwebui_user_id: str) -> str:
@@ -59,6 +60,7 @@ try:
     init_response = requests.post(
         SESSION_INIT_URL,
         headers=auth_headers,
+        json={"edge_device_ip": EDGE_DEVICE_IP},
         timeout=10,
     )
     init_response.raise_for_status()
